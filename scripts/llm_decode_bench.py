@@ -409,6 +409,7 @@ async def run_one_cell(
     state: TUIState,
     live: Live,
     engine: str = ENGINE_SGLANG,
+    no_think: bool = False,
 ) -> CellResult:
     messages = build_messages(context_tokens, context_text)
     payload = {
@@ -418,6 +419,8 @@ async def run_one_cell(
         "max_tokens": max_tokens,
         "stream_options": {"include_usage": True},
     }
+    if no_think:
+        payload["chat_template_kwargs"] = {"enable_thinking": False}
 
     url = f"{base_url}/v1/chat/completions"
     cancel_event = asyncio.Event()
@@ -1229,6 +1232,7 @@ async def run_benchmark(args):
                             state=state,
                             live=live,
                             engine=engine,
+                            no_think=args.no_think,
                         )
                         all_results.append(result)
                         _partial_results = all_results
@@ -1440,6 +1444,11 @@ def parse_args():
         help="KV cache budget in tokens. Overrides auto-detection. "
              "Cells where concurrency × (context + max_tokens) > budget are skipped. "
              "Use this for vLLM where auto-detection is unreliable. (default: 0 = auto-detect)"
+    )
+    parser.add_argument(
+        "--no-think", action="store_true", default=False,
+        help="Disable thinking/reasoning tokens by adding "
+             "chat_template_kwargs={'enable_thinking': false} to requests"
     )
     return parser.parse_args()
 
