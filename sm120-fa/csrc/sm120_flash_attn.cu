@@ -70,8 +70,10 @@ __device__ __forceinline__ float warp_sum(float v) {
 }
 
 // ============================================================================
-// Load A fragment from SMEM (row-major, stride = HEAD_DIM or BLOCK_N)
-// Correct PTX layout: Ra0=[g,2t], Ra1=[g+8,2t], Ra2=[g,2t+8], Ra3=[g+8,2t+8]
+// Load A fragment from SMEM using ldmatrix.x4 + register swap
+// ldmatrix output: [top-left, top-right, bottom-left, bottom-right]
+// MMA expects:     [top-left, bottom-left, top-right, bottom-right]
+// Fix: swap frag[1] and frag[2] after ldmatrix
 // ============================================================================
 __device__ __forceinline__ void load_A_frag(
     uint32_t frag[4],
@@ -81,23 +83,36 @@ __device__ __forceinline__ void load_A_frag(
     int stride,                  // row stride in bf16 elements
     int lane
 ) {
-    int g = lane / 4;
-    int t = lane % 4;
-    int r0 = row_offset + g;
-    int r1 = row_offset + g + 8;
-    int c0 = k_offset + t * 2;
-    int c1 = k_offset + t * 2 + 8;
+    // ldmatrix.x4 thread-to-address mapping:
+    //   sub = lane / 8 (0..3), sublane = lane % 8
+    //   row = row_offset + (sub/2)*8 + sublane
+    //   col = k_offset + (sub%2)*8
+    int sub = lane / 8;
+    int sublane = lane % 8;
+    int row = row_offset + (sub / 2) * 8 + sublane;
+    int col = k_offset + (sub % 2) * 8;
 
-    frag[0] = pack2(smem[r0 * stride + c0],     smem[r0 * stride + c0 + 1]);
-    frag[1] = pack2(smem[r1 * stride + c0],     smem[r1 * stride + c0 + 1]);
-    frag[2] = pack2(smem[r0 * stride + c1],     smem[r0 * stride + c1 + 1]);
-    frag[3] = pack2(smem[r1 * stride + c1],     smem[r1 * stride + c1 + 1]);
+    uint32_t addr = static_cast<uint32_t>(
+        __cvta_generic_to_shared(&smem[row * stride + col]));
+
+    asm volatile(
+        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+        : "=r"(frag[0]), "=r"(frag[1]), "=r"(frag[2]), "=r"(frag[3])
+        : "r"(addr)
+    );
+
+    // Swap frag[1] and frag[2]: ldmatrix gives [TL,TR,BL,BR], MMA wants [TL,BL,TR,BR]
+    uint32_t tmp = frag[1];
+    frag[1] = frag[2];
+    frag[2] = tmp;
 }
 
 // ============================================================================
 // Load B fragment from SMEM
 // B is K stored as [N, K] row-major (= col-major [K, N])
-// Rb0=[B[2t, g], B[2t+1, g]], Rb1=[B[2t+8, g], B[2t+9, g]]
+// Rb0=[K[g, 2t], K[g, 2t+1]], Rb1=[K[g, 2t+8], K[g, 2t+9]]
+// Using pack2 (ldmatrix.x2 for B needs .trans or transposed storage)
+// Keep pack2 for B since it's only 2 registers — low overhead
 // ============================================================================
 __device__ __forceinline__ void load_B_frag(
     uint32_t frag[2],
@@ -107,8 +122,8 @@ __device__ __forceinline__ void load_B_frag(
     int stride,                    // row stride (HEAD_DIM for K, BLOCK_N for P)
     int lane
 ) {
-    int g = lane / 4;  // n index within MMA_N=8
-    int t = lane % 4;  // k index pair
+    int g = lane / 4;
+    int t = lane % 4;
     int n = n_offset + g;
     int k0 = k_offset + t * 2;
     int k1 = k_offset + t * 2 + 8;
