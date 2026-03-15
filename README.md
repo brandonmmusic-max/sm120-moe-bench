@@ -92,7 +92,7 @@ Custom Flash Attention kernel built from scratch for SM120 (RTX PRO 6000 Blackwe
 | **v3.0 const-mem + DS + auto-dispatch** | **237** (Sq=2K) | **105% BEATS cuDNN** | 238/251 |
 | **v4.0 DS + per-warp mbarrier** | **242** | **102% BEATS cuDNN** | 229, 80B stack |
 | **v4.1 reg-optimized (current)** | **251** | **104% BEATS cuDNN** | 223, 0 stack |
-| **4-GPU P2P (Sq=131K)** | **679** | **304% BEATS cuDNN** | — |
+| **4-GPU P2P (Sq=131K)** | **679 eff** | 2.99x single-GPU scaling (76% of linear 4x) | — |
 
 ### Architecture (v3)
 
@@ -139,16 +139,18 @@ RTX PRO 6000 Blackwell (96GB, SM 12.0, 300W), BF16, non-causal, GQA Hq=32 Hkv=8:
 
 ### Multi-GPU Sequence-Parallel (4x RTX PRO 6000, P2P)
 
-| Sequence Length | Single GPU | cuDNN | **4-GPU P2P** | **vs cuDNN** |
-|---|---|---|---|---|
-| 4,096 | 247 TF | 228 TF | 92 TF | 0.40x |
-| 8,192 | 239 TF | 228 TF | 157 TF | 0.69x |
-| **16,384** | 239 TF | 232 TF | **263 TF** | **1.13x** |
-| **32,768** | 233 TF | 230 TF | **410 TF** | **1.78x** |
-| **65,536** | 233 TF | 224 TF | **570 TF** | **2.55x** |
-| **131,072** | 227 TF | 223 TF | **679 TF** | **3.04x** |
+Splits KV across 4 GPUs, each runs v4.1 on its local chunk, combines via online softmax. **Not a kernel-vs-kernel comparison** — this measures total system throughput using 4 GPUs vs single-GPU baselines.
 
-Crossover point: ~Sq=16K. At 131K context, 4-GPU P2P achieves 2.99x single-GPU scaling and 3.04x vs cuDNN.
+| Sequence Length | Single GPU v4.1 | **4-GPU P2P** | **Scaling** | % of Linear 4x |
+|---|---|---|---|---|
+| 4,096 | 247 TF | 92 TF | 0.37x | 9% (overhead dominates) |
+| 8,192 | 239 TF | 157 TF | 0.66x | 16% |
+| **16,384** | 239 TF | **263 TF** | **1.10x** | 28% |
+| **32,768** | 233 TF | **410 TF** | **1.76x** | 44% |
+| **65,536** | 233 TF | **570 TF** | **2.45x** | 61% |
+| **131,072** | 227 TF | **679 TF** | **2.99x** | **76%** |
+
+Crossover point: ~Sq=16K (below this, fixed ~3ms P2P overhead exceeds compute savings). At 131K context, 4-GPU achieves 2.99x single-GPU scaling — 76% of the theoretical 4x linear speedup, limited by PCIe Gen5 P2P transfer latency and the online softmax combine step.
 
 ### NCU Profiling Analysis (v4.1 reg-optimized, Sq=8192)
 
@@ -165,7 +167,7 @@ Crossover point: ~Sq=16K. At 131K context, 4-GPU P2P achieves 2.99x single-GPU s
 | Duration (Sq=8192) | 4.18ms | **4.09ms** | **-2.2%** |
 | Occupancy | 16.67% | 16.67% | Same (regs + SMEM limited) |
 
-**Bottleneck:** Tensor pipe at 83.6% is near-saturated at 16.67% occupancy. The kernel is fully compute-bound (DRAM 1.8%, L2 hit 98.2%). Remaining speedup opportunities per NCU: 25% from SMEM access patterns, 16% from occupancy (requires <128 regs), 5% from FP32 fma fusion.
+**Bottleneck:** Tensor pipe at 83.6% is near-saturated at 16.67% occupancy. The kernel is fully compute-bound (DRAM 1.8%, L2 hit 98.2%). Remaining single-GPU speedup opportunities per NCU: 25% from SMEM access patterns, 16% from occupancy (requires <128 regs), 5% from FP32 fma fusion.
 
 ### Key Discoveries
 
