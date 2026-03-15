@@ -389,6 +389,11 @@ extern "C" void sm120_flash_attn_forward(
     dim3 grid((Sq + BLOCK_M - 1) / BLOCK_M, batch * Hq);
     cudaFuncSetAttribute(sm120_flash_attn_fwd_v5,
         cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_BYTES);
+    // Prefer maximum shared memory carveout (minimize L1 cache for this kernel)
+    // since we're heavily SMEM-dependent and the spills go to L1
+    cudaFuncSetAttribute(sm120_flash_attn_fwd_v5,
+        cudaFuncAttributePreferredSharedMemoryCarveout,
+        cudaSharedmemCarveoutMaxShared);
     sm120_flash_attn_fwd_v5<<<grid, BLOCK_SIZE, SMEM_BYTES, stream>>>(
         Q, K, V, O, L, Sq, Skv, Hq, Hkv, sc);
 }
