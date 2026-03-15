@@ -201,9 +201,11 @@ docker exec -it your-container python3 /patches/apply_patches.py
 
 1. **K=64 kernel fix** unblocks MoE expert GEMM on SM120 — dense layers already had working tiles, MoE layers were stuck on slow fallback
 2. **P2P communication** gives 15-42% improvement when `iommu=pt` is set — the old advice to use `NCCL_P2P_DISABLE=1` on Threadripper may no longer apply with driver 595+
-3. **PCIe link width matters** — one GPU at x4 instead of x16 bottlenecks all TP allreduce operations; reseat cards if `lspci` shows degraded width
-4. **Prompt complexity affects throughput** — complex multi-factor legal analysis runs ~10% slower than simple factual lookups due to different MoE expert activation patterns
-5. **MTP inflates API-level numbers** — engine throughput (~139 tok/s) is the honest metric; API-level with think tokens shows ~283 tok/s
+3. **CUDA graphs are essential** — `--enforce-eager` drops decode from 139→40 tok/s (-71%). Kernel launch overhead dominates without graphs. Full analysis: [results/enforce_eager_analysis.md](results/enforce_eager_analysis.md)
+4. **PCIe link width matters** — one GPU at x4 instead of x16 bottlenecks all TP allreduce operations; reseat cards if `lspci` shows degraded width
+5. **Prompt complexity affects throughput** — complex multi-factor legal analysis runs 30-40% slower than specialized prompts due to MoE expert routing diversity. Full analysis: [results/klc_analysis.md](results/klc_analysis.md)
+6. **MTP inflates API-level numbers** — engine throughput (~139 tok/s) is the honest metric; API-level with think tokens shows ~283 tok/s
+7. **EP (Expert Parallelism) doesn't work on 4x96GB** — TP=2 EP=2 leaves 0 GiB for KV cache after model weights (62.5 GiB/GPU with TP=2). TP=4 is the correct config for this model on 4 GPUs
 
 ## Files
 
