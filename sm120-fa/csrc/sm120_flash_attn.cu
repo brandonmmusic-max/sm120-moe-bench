@@ -231,7 +231,9 @@ sm120_flash_attn_fwd_v5(
         if (kv + 1 < num_kv) cp_async_wait_one(); else cp_async_wait_all();
         __syncthreads();
 
-        // Q@K^T via MMA with swizzled reads
+        // Scoped block for Q@K^T + softmax + P staging
+        // s_acc dies at end of scope, freeing 32 registers for P@V
+        {
         float s_acc[2][8][2];
         #pragma unroll
         for (int rh = 0; rh < 2; rh++)
@@ -314,6 +316,7 @@ sm120_flash_attn_fwd_v5(
             p_s[row1 * BLOCK_N + col0]     = __float2bfloat16(s_acc[1][nt][0]);
             p_s[row1 * BLOCK_N + col0 + 1] = __float2bfloat16(s_acc[1][nt][1]);
         }
+        } // End scoped block — s_acc[2][8][2] is now dead, 32 registers freed
         __syncthreads();
 
         // P@V via MMA — P uses non-swizzled layout, V uses swizzled
