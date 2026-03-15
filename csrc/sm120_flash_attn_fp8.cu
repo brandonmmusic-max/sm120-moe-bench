@@ -155,25 +155,29 @@ sm120_fa_fp8(
     }
     __syncthreads();
 
-    // ldmatrix lane mappings
+    // ldmatrix lane mappings (FP8: b16 mode treats pairs of FP8 as one b16 element)
     const int ldm_q_row = warp * MMA_M + (lane & 7) + ((lane >> 3) & 1) * 8;
-    const int ldm_q_col_base = (lane >> 4) * 8;  // BF16: 8 elements per half
     const int ldm_k_lane_row = lane & 7;
-    const int ldm_k_col_off = ((lane >> 3) & 1) * 8;  // FP8: still 8-element groups for ldmatrix
-    const int ldm_v_row_off = (lane & 7) + ((lane >> 3) & 1) * 8;
 
-    // Q preload (BF16 → will be converted to FP8 for Q@K^T MMA)
-    // For FP8 m16n8k32: Q needs [16×32] fragments = 4 regs of 4 fp8 each
-    // But Q is BF16... we need to convert Q from BF16 to FP8 at point of use.
-    // Preload Q as BF16 fragments, convert to FP8 uint32_t packing inline.
-    // Actually, the MMA takes uint32_t for both A and B operands.
-    // For e4m3: each uint32_t holds 4 fp8 values.
-    // We load Q as BF16 via ldmatrix_x4 (2 bf16 per uint32_t), then convert.
-    //
-    // Conversion: BF16 pair → FP8 quad pack
-    // Each bf16 ldmatrix gives us 2 values per uint32_t.
-    // For FP8 MMA_K=32, we need 4 fp8 values per uint32_t.
-    // So we pack 2 bf16 fragments into 1 fp8 fragment.
+    // ============ Pre-convert Q from BF16 to FP8 in SMEM ============
+    // Overwrites Q area: BF16 Q (32KB) → FP8 Q (16KB, uses first half)
+    // After conversion, ldmatrix.x4 on FP8 Q gives MMA A fragments directly
+    // FP8 Q layout: q_fp8[row][col], 128 bytes per row (128 FP8 elements)
+    __nv_fp8_e4m3* q_fp8 = (__nv_fp8_e4m3*)q_s;  // reuse same SMEM
+    for (int i = tid; i < Q_ELEMS; i += BLOCK_SIZE) {
+        float val = __bfloat162float(q_s[i]);
+        // Write FP8 AFTER reading BF16 (safe: FP8 at offset i is at byte i,
+        // BF16 at offset i is at byte 2*i — FP8 writes don't overlap BF16 reads
+        // for i < Q_ELEMS/2, and for i >= Q_ELEMS/2 the BF16 has already been read)
+        q_fp8[i] = __nv_fp8_e4m3(val);
+    }
+    __syncthreads();
+
+    // FP8 Q ldmatrix addresses: 128 bytes per row, use SWIZZLE_NONE
+    // ldmatrix.x4 on FP8: loads 4 matrices of 8×8 "b16" = 512 bytes = 512 FP8 values
+    // Covers the full [16×32] A tile for m16n8k32
+    // Lane mapping: row = (lane&7) + ((lane>>3)&1)*8, col_half = (lane>>4)*16
+    const int ldm_q_col_fp8 = (lane >> 4) * 16;  // 0 or 16 FP8 values
 
     // Prefetch KV
     int hbytes = BLOCK_N * HALF_HD * 1;  // FP8: 1 byte per element
@@ -212,9 +216,8 @@ sm120_fa_fp8(
         mb_wait(&mbar_kv[cs], KV_PHASE(cs));
         FLIP_KV(cs);
 
-        // ============ Q@K^T with FP8 MMA ============
-        // For m16n8k32: HD/MMA_K = 128/32 = 4 ki iterations (was 8 with bf16!)
-        // BN/MMA_N = 128/8 = 16 ni iterations
+        // ============ Q@K^T with FP8 MMA — Q pre-converted in SMEM ============
+        // m16n8k32: HD/MMA_K = 128/32 = 4 ki, BN/MMA_N = 128/8 = 16 ni
         float s_acc[2][BLOCK_N/MMA_N][2];
         #pragma unroll
         for (int rh = 0; rh < 2; rh++)
@@ -224,59 +227,16 @@ sm120_fa_fp8(
 
         #pragma unroll
         for (int ki = 0; ki < HEAD_DIM/MMA_K; ki++) {
-            // Q fragment: load BF16 from SMEM, pack to FP8 uint32_t
-            // m16n8k32 A fragment: 4 uint32_t, each holding 4 fp8 values
-            // We need Q[row][ki*32 .. ki*32+31] as FP8
-            // Load 2 BF16 ldmatrix_x4 calls (each covers 16 BF16 cols = 16 fp8 values)
-            // Then pack pairs into fp8 uint32_t
-
-            // Load Q BF16 for cols ki*32..ki*32+15
-            uint32_t qbf16_lo[4];
-            {
-                int q_col = ki * MMA_K + ldm_q_col_base;
-                uint32_t qa = static_cast<uint32_t>(
-                    __cvta_generic_to_shared(&q_s[q_sw(ldm_q_row, q_col, Q_STRIDE)]));
-                ldmatrix_x4(qbf16_lo, qa);
-            }
-            // Load Q BF16 for cols ki*32+16..ki*32+31
-            uint32_t qbf16_hi[4];
-            {
-                int q_col = ki * MMA_K + 16 + ldm_q_col_base;
-                uint32_t qa = static_cast<uint32_t>(
-                    __cvta_generic_to_shared(&q_s[q_sw(ldm_q_row, q_col, Q_STRIDE)]));
-                ldmatrix_x4(qbf16_hi, qa);
-            }
-
-            // Convert BF16 pairs → FP8 quads
-            // qbf16_lo[i] has 2 bf16 values, qbf16_hi[i] has 2 bf16 values
-            // We need to pack 4 fp8 values into each uint32_t for the FP8 MMA A operand
-            // Pack: a[i] = {fp8(bf16_lo_0), fp8(bf16_lo_1), fp8(bf16_hi_0), fp8(bf16_hi_1)}
+            // Q: ldmatrix.x4 on pre-converted FP8 Q — ZERO conversion in hot loop!
             uint32_t qf8[4];
-            #pragma unroll
-            for (int i = 0; i < 4; i++) {
-                // Extract 2 bf16 from lo, 2 from hi
-                __nv_bfloat16 v0, v1, v2, v3;
-                asm("mov.b32 {%0, %1}, %2;" : "=h"(*(uint16_t*)&v0), "=h"(*(uint16_t*)&v1) : "r"(qbf16_lo[i]));
-                asm("mov.b32 {%0, %1}, %2;" : "=h"(*(uint16_t*)&v2), "=h"(*(uint16_t*)&v3) : "r"(qbf16_hi[i]));
-                // Convert to fp8
-                __nv_fp8_e4m3 f0(v0), f1(v1), f2(v2), f3(v3);
-                // Pack 4 fp8 into uint32_t
-                uint8_t b0 = *(uint8_t*)&f0, b1 = *(uint8_t*)&f1;
-                uint8_t b2 = *(uint8_t*)&f2, b3 = *(uint8_t*)&f3;
-                qf8[i] = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+            {
+                int q_col = ki * MMA_K + ldm_q_col_fp8;
+                uint32_t qa = static_cast<uint32_t>(
+                    __cvta_generic_to_shared(&q_fp8[ldm_q_row * HEAD_DIM + q_col]));
+                ldmatrix_x4(qf8, qa);
             }
 
-            // K fragment: load FP8 from SMEM
-            // For m16n8k32 B operand: 2 uint32_t, each with 4 fp8 values
-            // K is FP8 in SMEM with HALF_HD=64 stride (64 bytes per row)
-            // The B fragment maps: b[0] = K[g, 4t..4t+3], b[1] = K[g, 4t+16..4t+19]
-            // For the left half (ki*32 < 64): use KL8
-            // For the right half (ki*32 >= 64): use KR8
-            // K via ldmatrix.x2 treating FP8 pairs as b16!
-            // Each "b16" = 2 packed FP8 values. ldmatrix redistribution gives
-            // exactly the right m16n8k32 B fragment layout.
-            // Group 0 (lanes 0-7): K[kn+lane, lc..lc+15] (16 FP8 = 8 "b16")
-            // Group 1 (lanes 8-15): K[kn+lane-8, lc+16..lc+31] (next 16 FP8)
+            // K: ldmatrix.x2 (FP8 pairs as b16)
             __nv_fp8_e4m3* kh = (ki * MMA_K < HALF_HD) ? KL8(cs) : KR8(cs);
             int lc = ki * MMA_K - (ki * MMA_K >= HALF_HD ? HALF_HD : 0);
 
@@ -284,12 +244,10 @@ sm120_fa_fp8(
             for (int ni = 0; ni < BLOCK_N/MMA_N; ni++) {
                 uint32_t kf[2];
                 int kn = ni * MMA_N + ldm_k_lane_row;
-                // FP8: col offset = 16 bytes between groups (vs 16 bytes for BF16 too)
-                int k_col = lc + ((lane >> 3) & 1) * 16;  // 0 or 16 FP8 values
+                int k_col = lc + ((lane >> 3) & 1) * 16;
                 uint32_t k_addr = static_cast<uint32_t>(
                     __cvta_generic_to_shared(&kh[kn * KV_HALF_STRIDE + k_col]));
                 ldmatrix_x2(kf, k_addr);
-
                 float tl[4] = {s_acc[0][ni][0], s_acc[0][ni][1], s_acc[1][ni][0], s_acc[1][ni][1]};
                 mma_fp8(tl, qf8, kf);
                 s_acc[0][ni][0]=tl[0]; s_acc[0][ni][1]=tl[1]; s_acc[1][ni][0]=tl[2]; s_acc[1][ni][1]=tl[3];
