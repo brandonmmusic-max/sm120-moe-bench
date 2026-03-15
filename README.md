@@ -126,27 +126,40 @@ Measured with [llm_decode_bench.py](scripts/llm_decode_bench.py) using real gene
 
 ### Real-World Legal Prompt Benchmark (KLC)
 
-24 diverse Kentucky legal prompts across 6 categories, testing how MoE expert routing patterns affect throughput. See [benchmarks/klc_prompts.json](benchmarks/klc_prompts.json) for full prompt text.
+24 diverse Kentucky legal prompts across 6 categories, testing how MoE expert routing patterns affect decode throughput. Different prompt types activate different expert combinations, creating measurable throughput differences.
 
-**Single-user by prompt category:**
+Full analysis: **[results/klc_analysis.md](results/klc_analysis.md)** | Prompts: **[benchmarks/klc_prompts.json](benchmarks/klc_prompts.json)**
 
-| Category | Avg tok/s | Description |
-|----------|----------|-------------|
-| Specialized (employment, estate) | 153-159 | Focused expert routing |
-| Messy real-world (noise, irrelevant details) | 142-151 | Mixed signal filtering |
-| Short factual (statute lookups) | 155-161 | Quick expert activation |
-| Citation normalization (KRS, case law) | 149-156 | Legal-specific knowledge |
-| Trick/hallucination (fake doctrines) | 148-155 | Careful reasoning |
-| Complex multi-factor analysis | 140-148 | Deep, diverse expert routing |
+**Single-user decode speed by prompt category and output length:**
 
-**Multi-user system throughput (mixed prompts):**
+| Category | 1K tok/s | 2K tok/s | 3K tok/s | 4K tok/s | Description |
+|----------|---------|---------|---------|---------|-------------|
+| **Specialized** | 170 | 161 | 153 | 146 | Employment, estate — focused domain experts |
+| **Messy real-world** | 158 | 160 | 142 | 143 | Noisy inputs, irrelevant details to filter |
+| **Short factual** | 149 | 146 | 147 | 143 | Statute lookups, simple routing |
+| **Citation normalization** | 145 | 139 | 134 | 138 | KRS/case law cross-references |
+| **Trick/hallucination** | 129 | 126 | 121 | 151 | Must reason carefully, avoid fabrication |
+| **Complex multi-factor** | 119 | 113 | 109 | 140 | Divorce, PI damages — deepest routing |
 
-| Output Length | 1 user | 2 users (sys) | 4 users (sys) |
-|--------------|--------|--------------|--------------|
-| 1K | ~155 | ~270 | ~400 |
-| 2K | ~152 | ~263 | ~390 |
-| 3K | ~154 | ~251 | ~383 |
-| 4K | ~148 | ~256 | ~407 |
+**Key finding:** Complex multi-factor legal analysis runs **30-40% slower** than specialized prompts. This is because complex reasoning activates more diverse expert combinations per token, reducing cache locality and MTP speculation acceptance. Specialized prompts repeatedly activate focused expert clusters.
+
+**TTFT by category:**
+
+| Category | Avg TTFT |
+|----------|---------|
+| Short factual / Specialized | ~70ms |
+| Citation / Messy | ~75-85ms |
+| Complex / Trick | **~110-165ms** |
+
+Complex and trick prompts have ~2x higher TTFT, likely from more diverse expert activation during prefill.
+
+**Multi-user system throughput (mixed prompt types):**
+
+| Concurrency | System tok/s | Per-user tok/s |
+|------------|-------------|---------------|
+| 1 user | ~140-170 | ~140-170 |
+| 2 users | ~250-270 | ~125-135 |
+| 4 users | ~365-410 | ~91-103 |
 
 ### Methodology Notes
 
