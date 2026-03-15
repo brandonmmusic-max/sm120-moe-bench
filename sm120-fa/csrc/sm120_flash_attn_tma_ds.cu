@@ -167,7 +167,9 @@ sm120_fa_tma_ds(
         // Q@K^T
         float s_acc[2][BLOCK_N/MMA_N][2];
         #pragma unroll
-        for (int rh=0;rh<2;rh++) #pragma unroll
+        #pragma unroll
+        for (int rh=0;rh<2;rh++)
+            #pragma unroll
             for (int nt=0;nt<BLOCK_N/MMA_N;nt++) s_acc[rh][nt][0]=s_acc[rh][nt][1]=0;
 
         #pragma unroll
@@ -197,7 +199,9 @@ sm120_fa_tma_ds(
         // Scale+mask
         int kvs = kv*BLOCK_N;
         #pragma unroll
-        for (int rh=0;rh<2;rh++) #pragma unroll
+        #pragma unroll
+        for (int rh=0;rh<2;rh++)
+            #pragma unroll
             for (int nt=0;nt<BLOCK_N/MMA_N;nt++) {
                 s_acc[rh][nt][0]*=scale; s_acc[rh][nt][1]*=scale;
                 int ki0=kvs+nt*MMA_N+t*2;
