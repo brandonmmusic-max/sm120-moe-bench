@@ -39,11 +39,20 @@
 #define KV_HALF_ELEMS (BLOCK_N * KV_HALF_STRIDE)
 #define SMEM_BYTES ((Q_ELEMS + NUM_STAGES * 4 * KV_HALF_ELEMS) * 2 + 128)
 
+// Swizzle functions optimized for integer MAD fusion.
+// The compiler can fuse r*s + offset into a single IMAD instruction.
+// Pre-shift the XOR result to avoid the /2 (which inhibits fusion).
 __device__ __forceinline__ int q_sw(int r, int c, int s) {
-    return r * s + ((c*2) ^ ((r&7)<<5)) / 2;
+    // Q: 256-byte rows, XOR bits[7:5]. s=HEAD_DIM=128.
+    int byte_off = c << 1;  // c*2
+    int swizzled = byte_off ^ ((r & 7) << 5);
+    return r * s + (swizzled >> 1);  // IMAD: r*128 + swizzled_col
 }
 __device__ __forceinline__ int tma_sw(int r, int c, int s) {
-    return r * s + ((c*2) ^ ((r&7)<<4)) / 2;
+    // K/V: 128-byte rows, XOR bits[6:4]. s=HALF_HD=64.
+    int byte_off = c << 1;
+    int swizzled = byte_off ^ ((r & 7) << 4);
+    return r * s + (swizzled >> 1);  // IMAD: r*64 + swizzled_col
 }
 __device__ __forceinline__ uint32_t pk_f2(float a, float b) {
     __nv_bfloat16 ha = __float2bfloat16(a), hb = __float2bfloat16(b);
@@ -274,7 +283,7 @@ sm120_fa_v4(
                 if(ki0+1>=Skv) s_acc[rh][nt][1]=-FLT_MAX;
             }
 
-        // Softmax
+        // Softmax — FP32 fused multiply-add where possible
         for (int rh=0;rh<2;rh++) {
             float tm=rmax[rh];
             #pragma unroll
@@ -282,15 +291,23 @@ sm120_fa_v4(
             float nm=tm;
             nm=fmaxf(nm,__shfl_xor_sync(0xffffffff,nm,1));
             nm=fmaxf(nm,__shfl_xor_sync(0xffffffff,nm,2));
-            float rs=__expf(rmax[rh]-nm); rsum[rh]*=rs;
+            float rs=__expf(rmax[rh]-nm);
+            // FMA: rsum = rsum * rs (standalone mul, can't fuse further)
+            rsum[rh]*=rs;
+            // Rescale o_acc: o *= rs  (standalone muls on FP32 pipe)
             #pragma unroll
             for (int nt=0;nt<16;nt++) { o_acc[rh][nt][0]*=rs; o_acc[rh][nt][1]*=rs; }
+            // Exp + accumulate with FMA: ls = fmaf(1.0f, exp_val, ls)
             float ls=0;
             #pragma unroll
             for (int nt=0;nt<BLOCK_N/MMA_N;nt++) {
-                s_acc[rh][nt][0]=__expf(s_acc[rh][nt][0]-nm);
-                s_acc[rh][nt][1]=__expf(s_acc[rh][nt][1]-nm);
-                ls+=s_acc[rh][nt][0]+s_acc[rh][nt][1];
+                float e0=__expf(s_acc[rh][nt][0]-nm);
+                float e1=__expf(s_acc[rh][nt][1]-nm);
+                s_acc[rh][nt][0]=e0;
+                s_acc[rh][nt][1]=e1;
+                // FMA accumulation: ls += e0 + e1
+                ls=fmaf(1.0f, e0, ls);
+                ls=fmaf(1.0f, e1, ls);
             }
             ls+=__shfl_xor_sync(0xffffffff,ls,1); ls+=__shfl_xor_sync(0xffffffff,ls,2);
             rsum[rh]+=ls; rmax[rh]=nm;
@@ -304,13 +321,16 @@ sm120_fa_v4(
             pf[1]=pk_f2(s_acc[1][ki*2][0],s_acc[1][ki*2][1]);
             pf[2]=pk_f2(s_acc[0][ki*2+1][0],s_acc[0][ki*2+1][1]);
             pf[3]=pk_f2(s_acc[1][ki*2+1][0],s_acc[1][ki*2+1][1]);
+            // V address: use bitwise ops since HALF_HD=64 is power of 2
+            int v_row = ki*MMA_K + ldm_v_row_off;
             #pragma unroll
             for (int di=0;di<HEAD_DIM/MMA_N;di++) {
                 uint32_t vf[2];
-                int dc=di*MMA_N, vh=dc/HALF_HD, vlc=dc-vh*HALF_HD;
-                __nv_bfloat16* vhp=(vh==0)?VL(cs):VR(cs);
+                int dc=di*MMA_N;
+                int vlc = dc & (HALF_HD-1);    // dc % 64 via bitmask
+                __nv_bfloat16* vhp = (dc < HALF_HD) ? VL(cs) : VR(cs);
                 uint32_t v_addr=static_cast<uint32_t>(
-                    __cvta_generic_to_shared(&vhp[tma_sw(ki*MMA_K+ldm_v_row_off, vlc, KV_HALF_STRIDE)]));
+                    __cvta_generic_to_shared(&vhp[tma_sw(v_row, vlc, KV_HALF_STRIDE)]));
                 ldmatrix_x2_trans(vf, v_addr);
                 float ot[4]={o_acc[0][di][0],o_acc[0][di][1],o_acc[1][di][0],o_acc[1][di][1]};
                 mma16(ot,pf,vf);
