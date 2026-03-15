@@ -174,6 +174,8 @@ Complex and trick prompts have ~2x higher TTFT, likely from more diverse expert 
 
 ### 1. Run the decode benchmark
 
+Engine throughput benchmark from [voipmonitor/llm-inference-bench](https://github.com/voipmonitor/llm-inference-bench).
+
 ```bash
 pip install httpx rich
 python3 scripts/llm_decode_bench.py \
@@ -233,6 +235,14 @@ docker exec -it your-container python3 /patches/apply_patches.py
 │   └── apply_patches.py
 └── LICENSE
 ```
+
+## Acknowledgments
+
+- **[voipmonitor/llm-inference-bench](https://github.com/voipmonitor/llm-inference-bench)** — decode throughput benchmark script used for all engine-level measurements
+- **[NVIDIA/cutlass](https://github.com/NVIDIA/cutlass)** — the block-scaled MoE GEMM builder that was patched
+- **[flashinfer-ai/flashinfer](https://github.com/flashinfer-ai/flashinfer)** — MoE kernel codegen and dispatch
+- **[vllm-project/vllm](https://github.com/vllm-project/vllm)** — inference engine
+- **[Claude Code](https://claude.com/claude-code)** — assisted with kernel development, benchmarking, and analysis
 
 ## Related
 
