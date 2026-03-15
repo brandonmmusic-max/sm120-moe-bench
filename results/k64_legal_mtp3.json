@@ -1,0 +1,17 @@
+[
+  {
+    "users": 1,
+    "system_tps": 139.2,
+    "per_user_tps": 139.2
+  },
+  {
+    "users": 2,
+    "system_tps": 232.1,
+    "per_user_tps": 116.0
+  },
+  {
+    "users": 4,
+    "system_tps": 372.2,
+    "per_user_tps": 93.0
+  }
+]

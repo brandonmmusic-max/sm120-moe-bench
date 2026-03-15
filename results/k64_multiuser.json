@@ -1,0 +1,26 @@
+[
+  {
+    "label": "1 concurrent users, 1K output",
+    "system_tps": 282.4430020289439,
+    "per_user_tps": 282.4430020289439,
+    "users": 1
+  },
+  {
+    "label": "4 concurrent users, 1K output",
+    "system_tps": 850.3381542025332,
+    "per_user_tps": 212.5845385506333,
+    "users": 4
+  },
+  {
+    "label": "8 concurrent users, 1K output",
+    "system_tps": 1282.7694557234238,
+    "per_user_tps": 160.34618196542797,
+    "users": 8
+  },
+  {
+    "label": "16 concurrent users, 1K output",
+    "system_tps": 1623.9072227297236,
+    "per_user_tps": 101.49420142060772,
+    "users": 16
+  }
+]

@@ -1,0 +1,94 @@
+{
+  "short_statute": {
+    "category": "short_factual",
+    "prompt": "What is the statute of limitations for personal injury claims in Kentucky?"
+  },
+  "short_dui": {
+    "category": "short_factual",
+    "prompt": "What is the legal blood alcohol limit for DUI in Kentucky?"
+  },
+  "short_contract": {
+    "category": "short_factual",
+    "prompt": "What is the statute of limitations for breach of a written contract in Kentucky?"
+  },
+  "cite_comparative": {
+    "category": "citation",
+    "prompt": "Explain the difference between KRS 411.182 comparative fault and the old contributory negligence bar rule. When did Kentucky change and what cases led to the change?"
+  },
+  "cite_broad_form": {
+    "category": "citation",
+    "prompt": "How does Kentucky law address the broad form deed for mineral rights? Cite the relevant constitutional amendment, KRS sections, and key case law including Ward v. Harding."
+  },
+  "cite_summary_judgment": {
+    "category": "citation",
+    "prompt": "What standard does Kentucky apply for summary judgment motions? How does the Steelvest standard differ from the federal Celotex standard? Cite the relevant civil rules and case law."
+  },
+  "trick_holographic": {
+    "category": "trick",
+    "prompt": "Are holographic wills valid in Kentucky? What about a holographic will executed in Tennessee by a Kentucky domiciliary?"
+  },
+  "trick_castle": {
+    "category": "trick",
+    "prompt": "Under what circumstances does Kentucky's castle doctrine authorize the use of deadly force? Is there a duty to retreat in your own home?"
+  },
+  "trick_grandparent": {
+    "category": "trick",
+    "prompt": "Do grandparents have an absolute right to visitation in Kentucky? Can a grandparent petition for custody?"
+  },
+  "complex_divorce": {
+    "category": "complex_analysis",
+    "prompt": "Representing wife in a contested divorce. Married 18 years, 2 kids (14 and 11). Husband owns a plumbing business he started 3 years before marriage but grew substantially during. He's claiming the whole business is non-marital. Wife was a SAHM for 12 years, just started working part-time making $28k. Husband's pulling about $180k between salary and distributions. He also just moved his girlfriend into the marital home while wife and kids are at her mom's. We filed for a DVO but it was denied - no physical violence, just emotional stuff. Judge set temporary support at $2,800/mo which barely covers rent. What's my best strategy for the property hearing, and should I push for maintenance or focus on getting a bigger property split?"
+  },
+  "complex_mineral": {
+    "category": "complex_analysis",
+    "prompt": "Got a client who bought 40 acres in Carter County 5 years ago. Previous owner had severed mineral rights back in 1962 with a broad form deed. Now an energy company shows up wanting to do horizontal drilling and they're citing the old mineral deed. Client says no way - the surface damage would destroy his cattle operation. I know about the '88 constitutional amendment but the mineral deed has some unusual language granting 'all methods necessary.' What's my argument to block this and do I have any leverage?"
+  },
+  "complex_pi": {
+    "category": "complex_analysis",
+    "prompt": "Rear-end collision on I-75 in Madison County. My client (plaintiff) was stopped in traffic, got hit from behind by a semi doing about 40. Clear liability. Client has a herniated disc at L4-L5, had a microdiscectomy 4 months after the wreck. Was doing great, then reinjured it lifting something at work 8 months later. Defense is now saying the surgery failed because of the workplace reinjury, not the original wreck. Client's total meds are about $180k. Lost wages around $45k so far, and the surgeon says he'll need a fusion eventually - another $120k. The trucker's company has a $1M policy. What's my damages theory and how do I deal with the reinjury problem?"
+  },
+  "messy_eviction": {
+    "category": "messy_real_world",
+    "prompt": "Client owns a duplex in Lexington, tenant in unit B hasn't paid rent in 4 months ($1,200/mo so $4,800 owed). Lease expired 6 months ago but tenant stayed and client kept accepting rent - until the checks stopped coming. Now tenant says she's withholding rent because the furnace hasn't worked right all winter and there's mold in the bathroom. Client admits the furnace is old but says it works, just not great. Haven't looked at the mold. Tenant also has 2 unauthorized dogs in violation of the lease. Client wants her out yesterday. What's the fastest legal path and am I exposed on the habitability stuff?"
+  },
+  "messy_dui_suppress": {
+    "category": "messy_real_world",
+    "prompt": "Defending a DUI case in Hardin County. Client blew a .12 on the breathalyzer at the station. Here's the wrinkle - the officer used an Intoxilyzer 9000 that had been certified 13 months ago, and the regulation says recertification every 12 months. Also, the officer's own certification to operate the machine expired 2 months before the arrest. Client's a commercial truck driver and a conviction means he loses his CDL permanently for a first offense because commercial limit is .04. Judge is known to be tough on DUI. What's my play?"
+  },
+  "messy_slip_fall": {
+    "category": "messy_real_world",
+    "prompt": "I was attacked in an apartment complex parking lot at night. There were no security guards and the lights were broken. The owner says crime wasn't foreseeable. Also, my neighbor is annoying but I don't think that's related. The police report shows 3 muggings in the same lot in the past year. I have medical bills of $23,000 and missed 6 weeks of work."
+  },
+  "employment_age": {
+    "category": "specialized",
+    "prompt": "Client is a restaurant manager in Louisville, 54 years old, been there 15 years. New regional VP comes in, starts making comments about 'fresh ideas' and 'young energy,' reassigns my client's best shifts to younger managers, puts her on a PIP with impossible metrics nobody else has to meet, and terminates her 3 months later for 'performance.' She's never had a bad review before the new VP. Oh, and the new VP hired his 28-year-old friend to replace her. She wants to know if she has a case and how much it's worth."
+  },
+  "estate_contest": {
+    "category": "specialized",
+    "prompt": "Dad died last month, left a will from 2019 leaving everything to his second wife. Three adult kids from first marriage are furious. The will was drafted by a local attorney and properly witnessed. But here's the thing - dad was diagnosed with moderate dementia in 2018, and the kids have medical records showing cognitive decline. Second wife drove dad to the attorney's office and was in the waiting room. Kids want to contest. Estate is about $800k - house, farm equipment, and a $300k life insurance policy naming second wife as beneficiary. What are the kids' realistic chances on a will contest, and is there any play on the life insurance?"
+  },
+  "construction_lien": {
+    "category": "specialized",
+    "prompt": "Small construction company client entered a fixed-price contract to build a 4,000 sq ft house in Fayette County for $450k. Midway through, homeowner started demanding upgrades - granite counters, upgraded HVAC, custom tile work. My client did the extras based on verbal promises to pay, never got change orders signed. Now the house is done, homeowner refuses to pay the extra $85k, says 'that was included in the original price.' My client hasn't been paid the final draw of $112k either. The house is worth about $620k. What are my options and how fast can I get my client paid?"
+  },
+  "custody_mod": {
+    "category": "specialized",
+    "prompt": "Custody modification situation. Original decree from 3 years ago gave mom primary custody, dad gets every other weekend. Dad's remarried, stable home, making good money as an electrician. Mom just got her third DUI - this time with the kids in the car, ages 6 and 9. Kids were placed with dad temporarily by CPS. Mom did 30 days in jail, just got out, completed a 28-day inpatient program, and now wants the kids back. Dad filed for custody modification. Mom's attorney is arguing the treatment shows she's rehabilitated and there's no changed circumstances beyond a 'single incident.' What's my argument for dad?"
+  },
+  "medmal_procedure": {
+    "category": "specialized",
+    "prompt": "Client walked into a med mal case. 62-year-old guy went in for a routine knee replacement at a hospital in Kenton County. Surgeon nicked the popliteal artery during the procedure, didn't catch it in the OR, and by the time they figured it out 6 hours later in recovery, client lost so much blood he had a stroke. Now he's got permanent left-side weakness, can't drive, needs daily assistance. He was a self-employed home inspector making about $95k/year, planned to work until 70. The surgical note says 'unremarkable procedure' - no mention of the arterial damage. What do I need to do before I can even file this?"
+  },
+  "criminal_search": {
+    "category": "specialized",
+    "prompt": "Client got pulled over on I-64 in Rowan County for 'weaving.' Officer says he smelled marijuana, searched the car, found 2 oz of weed and a handgun. Client has a valid CCDW permit for the gun. Problem is - dashcam shows the car barely touched the lane line once. No field sobriety test was offered. Officer went straight to 'I smell marijuana' and searched. Client has no priors, works as a nurse, and a conviction would cost her license. What's my suppression argument and what am I looking at if we lose the motion?"
+  },
+  "workers_comp": {
+    "category": "specialized",
+    "prompt": "Workers' comp case in Perry County. Coal miner with 22 years underground, diagnosed with coal workers' pneumoconiosis (black lung) - both simple and complicated. He's 58, can't work underground anymore. His last employer went bankrupt 2 years ago and their workers comp carrier says coverage ended when the company folded. Previous employer (15 years there) says it's not their problem because the last employer should be responsible. The miner is getting sicker and needs benefits now. Where do I file and who pays?"
+  },
+  "partition_farm": {
+    "category": "specialized",
+    "prompt": "Two siblings inherited their parents' 120-acre farm in Shelby County equally. Brother wants to sell to a developer for $1.8M. Sister refuses - she lives on the property, has maintained it for 15 years, and runs a small hay operation. They can't agree on anything. Brother wants to force a sale. What are sister's options to keep the property or at least get fair value?"
+  }
+}

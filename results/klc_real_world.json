@@ -1,0 +1,866 @@
+[
+  {
+    "prompt_key": "short_statute",
+    "category": "short_factual",
+    "tokens": 1024,
+    "time": 6.49,
+    "ttft": 0.07,
+    "tps": 157.8,
+    "error": ""
+  },
+  {
+    "prompt_key": "cite_comparative",
+    "category": "citation",
+    "tokens": 1024,
+    "time": 6.45,
+    "ttft": 0.058,
+    "tps": 158.8,
+    "error": ""
+  },
+  {
+    "prompt_key": "trick_holographic",
+    "category": "trick",
+    "tokens": 1024,
+    "time": 6.29,
+    "ttft": 0.055,
+    "tps": 162.9,
+    "error": ""
+  },
+  {
+    "prompt_key": "complex_divorce",
+    "category": "complex_analysis",
+    "tokens": 1024,
+    "time": 6.41,
+    "ttft": 0.085,
+    "tps": 159.8,
+    "error": ""
+  },
+  {
+    "prompt_key": "messy_eviction",
+    "category": "messy_real_world",
+    "tokens": 1024,
+    "time": 6.5,
+    "ttft": 0.084,
+    "tps": 157.6,
+    "error": ""
+  },
+  {
+    "prompt_key": "employment_age",
+    "category": "specialized",
+    "tokens": 1024,
+    "time": 6.01,
+    "ttft": 0.069,
+    "tps": 170.3,
+    "error": ""
+  },
+  {
+    "prompt_key": "short_statute",
+    "category": "short_factual",
+    "tokens": 1024,
+    "time": 6.98,
+    "ttft": 0.074,
+    "tps": 146.6,
+    "error": ""
+  },
+  {
+    "prompt_key": "short_dui",
+    "category": "short_factual",
+    "tokens": 1024,
+    "time": 6.69,
+    "ttft": 0.074,
+    "tps": 153.1,
+    "error": ""
+  },
+  {
+    "prompt_key": "short_contract",
+    "category": "short_factual",
+    "tokens": 1024,
+    "time": 7.59,
+    "ttft": 0.078,
+    "tps": 135.0,
+    "error": ""
+  },
+  {
+    "prompt_key": "cite_comparative",
+    "category": "citation",
+    "tokens": 1024,
+    "time": 7.54,
+    "ttft": 0.078,
+    "tps": 135.8,
+    "error": ""
+  },
+  {
+    "prompt_key": "cite_broad_form",
+    "category": "citation",
+    "tokens": 1024,
+    "time": 7.57,
+    "ttft": 0.08,
+    "tps": 135.3,
+    "error": ""
+  },
+  {
+    "prompt_key": "cite_summary_judgment",
+    "category": "citation",
+    "tokens": 1024,
+    "time": 7.34,
+    "ttft": 0.079,
+    "tps": 139.5,
+    "error": ""
+  },
+  {
+    "prompt_key": "short_statute",
+    "category": "short_factual",
+    "tokens": 1024,
+    "time": 8.82,
+    "ttft": 0.09,
+    "tps": 116.0,
+    "error": ""
+  },
+  {
+    "prompt_key": "short_dui",
+    "category": "short_factual",
+    "tokens": 1024,
+    "time": 8.73,
+    "ttft": 0.09,
+    "tps": 117.3,
+    "error": ""
+  },
+  {
+    "prompt_key": "short_contract",
+    "category": "short_factual",
+    "tokens": 1024,
+    "time": 8.99,
+    "ttft": 0.09,
+    "tps": 113.9,
+    "error": ""
+  },
+  {
+    "prompt_key": "cite_comparative",
+    "category": "citation",
+    "tokens": 1024,
+    "time": 8.82,
+    "ttft": 0.09,
+    "tps": 116.0,
+    "error": ""
+  },
+  {
+    "prompt_key": "cite_broad_form",
+    "category": "citation",
+    "tokens": 1024,
+    "time": 8.62,
+    "ttft": 0.061,
+    "tps": 118.7,
+    "error": ""
+  },
+  {
+    "prompt_key": "cite_summary_judgment",
+    "category": "citation",
+    "tokens": 1024,
+    "time": 8.84,
+    "ttft": 0.18,
+    "tps": 115.8,
+    "error": ""
+  },
+  {
+    "prompt_key": "trick_holographic",
+    "category": "trick",
+    "tokens": 1024,
+    "time": 9.44,
+    "ttft": 0.115,
+    "tps": 108.5,
+    "error": ""
+  },
+  {
+    "prompt_key": "trick_castle",
+    "category": "trick",
+    "tokens": 1024,
+    "time": 9.16,
+    "ttft": 0.179,
+    "tps": 111.8,
+    "error": ""
+  },
+  {
+    "prompt_key": "trick_grandparent",
+    "category": "trick",
+    "tokens": 1024,
+    "time": 9.19,
+    "ttft": 0.125,
+    "tps": 111.4,
+    "error": ""
+  },
+  {
+    "prompt_key": "complex_divorce",
+    "category": "complex_analysis",
+    "tokens": 1024,
+    "time": 9.5,
+    "ttft": 0.125,
+    "tps": 107.8,
+    "error": ""
+  },
+  {
+    "prompt_key": "complex_mineral",
+    "category": "complex_analysis",
+    "tokens": 1024,
+    "time": 10.54,
+    "ttft": 0.124,
+    "tps": 97.2,
+    "error": ""
+  },
+  {
+    "prompt_key": "complex_pi",
+    "category": "complex_analysis",
+    "tokens": 1024,
+    "time": 10.14,
+    "ttft": 0.124,
+    "tps": 101.0,
+    "error": ""
+  },
+  {
+    "prompt_key": "short_statute",
+    "category": "short_factual",
+    "tokens": 2048,
+    "time": 13.01,
+    "ttft": 0.068,
+    "tps": 157.4,
+    "error": ""
+  },
+  {
+    "prompt_key": "cite_comparative",
+    "category": "citation",
+    "tokens": 2048,
+    "time": 13.86,
+    "ttft": 0.067,
+    "tps": 147.7,
+    "error": ""
+  },
+  {
+    "prompt_key": "trick_holographic",
+    "category": "trick",
+    "tokens": 2048,
+    "time": 12.61,
+    "ttft": 0.081,
+    "tps": 162.4,
+    "error": ""
+  },
+  {
+    "prompt_key": "complex_divorce",
+    "category": "complex_analysis",
+    "tokens": 2048,
+    "time": 13.33,
+    "ttft": 0.091,
+    "tps": 153.7,
+    "error": ""
+  },
+  {
+    "prompt_key": "messy_eviction",
+    "category": "messy_real_world",
+    "tokens": 2048,
+    "time": 12.76,
+    "ttft": 0.071,
+    "tps": 160.4,
+    "error": ""
+  },
+  {
+    "prompt_key": "employment_age",
+    "category": "specialized",
+    "tokens": 2048,
+    "time": 12.73,
+    "ttft": 0.072,
+    "tps": 160.9,
+    "error": ""
+  },
+  {
+    "prompt_key": "short_statute",
+    "category": "short_factual",
+    "tokens": 2048,
+    "time": 15.29,
+    "ttft": 0.081,
+    "tps": 134.0,
+    "error": ""
+  },
+  {
+    "prompt_key": "short_dui",
+    "category": "short_factual",
+    "tokens": 2048,
+    "time": 14.49,
+    "ttft": 0.08,
+    "tps": 141.3,
+    "error": ""
+  },
+  {
+    "prompt_key": "short_contract",
+    "category": "short_factual",
+    "tokens": 2048,
+    "time": 14.76,
+    "ttft": 0.052,
+    "tps": 138.7,
+    "error": ""
+  },
+  {
+    "prompt_key": "cite_comparative",
+    "category": "citation",
+    "tokens": 2048,
+    "time": 14.97,
+    "ttft": 0.111,
+    "tps": 136.8,
+    "error": ""
+  },
+  {
+    "prompt_key": "cite_broad_form",
+    "category": "citation",
+    "tokens": 2048,
+    "time": 15.72,
+    "ttft": 0.084,
+    "tps": 130.3,
+    "error": ""
+  },
+  {
+    "prompt_key": "cite_summary_judgment",
+    "category": "citation",
+    "tokens": 2048,
+    "time": 14.79,
+    "ttft": 0.084,
+    "tps": 138.5,
+    "error": ""
+  },
+  {
+    "prompt_key": "short_statute",
+    "category": "short_factual",
+    "tokens": 2048,
+    "time": 19.67,
+    "ttft": 0.119,
+    "tps": 104.1,
+    "error": ""
+  },
+  {
+    "prompt_key": "short_dui",
+    "category": "short_factual",
+    "tokens": 2048,
+    "time": 18.15,
+    "ttft": 0.119,
+    "tps": 112.8,
+    "error": ""
+  },
+  {
+    "prompt_key": "short_contract",
+    "category": "short_factual",
+    "tokens": 2048,
+    "time": 19.48,
+    "ttft": 0.055,
+    "tps": 105.1,
+    "error": ""
+  },
+  {
+    "prompt_key": "cite_comparative",
+    "category": "citation",
+    "tokens": 2048,
+    "time": 19.45,
+    "ttft": 0.118,
+    "tps": 105.3,
+    "error": ""
+  },
+  {
+    "prompt_key": "cite_broad_form",
+    "category": "citation",
+    "tokens": 2048,
+    "time": 19.53,
+    "ttft": 0.103,
+    "tps": 104.9,
+    "error": ""
+  },
+  {
+    "prompt_key": "cite_summary_judgment",
+    "category": "citation",
+    "tokens": 2048,
+    "time": 20.5,
+    "ttft": 0.103,
+    "tps": 99.9,
+    "error": ""
+  },
+  {
+    "prompt_key": "trick_holographic",
+    "category": "trick",
+    "tokens": 2048,
+    "time": 19.27,
+    "ttft": 0.102,
+    "tps": 106.3,
+    "error": ""
+  },
+  {
+    "prompt_key": "trick_castle",
+    "category": "trick",
+    "tokens": 2048,
+    "time": 19.11,
+    "ttft": 0.102,
+    "tps": 107.2,
+    "error": ""
+  },
+  {
+    "prompt_key": "trick_grandparent",
+    "category": "trick",
+    "tokens": 2048,
+    "time": 19.17,
+    "ttft": 0.204,
+    "tps": 106.9,
+    "error": ""
+  },
+  {
+    "prompt_key": "complex_divorce",
+    "category": "complex_analysis",
+    "tokens": 2048,
+    "time": 20.86,
+    "ttft": 0.077,
+    "tps": 98.2,
+    "error": ""
+  },
+  {
+    "prompt_key": "complex_mineral",
+    "category": "complex_analysis",
+    "tokens": 2048,
+    "time": 22.18,
+    "ttft": 0.203,
+    "tps": 92.3,
+    "error": ""
+  },
+  {
+    "prompt_key": "complex_pi",
+    "category": "complex_analysis",
+    "tokens": 2048,
+    "time": 22.23,
+    "ttft": 0.203,
+    "tps": 92.1,
+    "error": ""
+  },
+  {
+    "prompt_key": "short_statute",
+    "category": "short_factual",
+    "tokens": 3072,
+    "time": 18.78,
+    "ttft": 0.054,
+    "tps": 163.6,
+    "error": ""
+  },
+  {
+    "prompt_key": "cite_comparative",
+    "category": "citation",
+    "tokens": 3072,
+    "time": 19.32,
+    "ttft": 0.063,
+    "tps": 159.0,
+    "error": ""
+  },
+  {
+    "prompt_key": "trick_holographic",
+    "category": "trick",
+    "tokens": 3072,
+    "time": 19.01,
+    "ttft": 0.077,
+    "tps": 161.6,
+    "error": ""
+  },
+  {
+    "prompt_key": "complex_divorce",
+    "category": "complex_analysis",
+    "tokens": 3072,
+    "time": 21.34,
+    "ttft": 0.076,
+    "tps": 143.9,
+    "error": ""
+  },
+  {
+    "prompt_key": "messy_eviction",
+    "category": "messy_real_world",
+    "tokens": 3072,
+    "time": 21.62,
+    "ttft": 0.096,
+    "tps": 142.1,
+    "error": ""
+  },
+  {
+    "prompt_key": "employment_age",
+    "category": "specialized",
+    "tokens": 3072,
+    "time": 20.05,
+    "ttft": 0.096,
+    "tps": 153.2,
+    "error": ""
+  },
+  {
+    "prompt_key": "short_statute",
+    "category": "short_factual",
+    "tokens": 3072,
+    "time": 23.4,
+    "ttft": 0.067,
+    "tps": 131.3,
+    "error": ""
+  },
+  {
+    "prompt_key": "short_dui",
+    "category": "short_factual",
+    "tokens": 3072,
+    "time": 21.81,
+    "ttft": 0.067,
+    "tps": 140.8,
+    "error": ""
+  },
+  {
+    "prompt_key": "short_contract",
+    "category": "short_factual",
+    "tokens": 3059,
+    "time": 22.19,
+    "ttft": 0.086,
+    "tps": 137.8,
+    "error": ""
+  },
+  {
+    "prompt_key": "cite_comparative",
+    "category": "citation",
+    "tokens": 3072,
+    "time": 24.02,
+    "ttft": 0.085,
+    "tps": 127.9,
+    "error": ""
+  },
+  {
+    "prompt_key": "cite_broad_form",
+    "category": "citation",
+    "tokens": 3072,
+    "time": 26.16,
+    "ttft": 0.088,
+    "tps": 117.5,
+    "error": ""
+  },
+  {
+    "prompt_key": "cite_summary_judgment",
+    "category": "citation",
+    "tokens": 3072,
+    "time": 24.41,
+    "ttft": 0.088,
+    "tps": 125.9,
+    "error": ""
+  },
+  {
+    "prompt_key": "short_statute",
+    "category": "short_factual",
+    "tokens": 3072,
+    "time": 30.49,
+    "ttft": 0.079,
+    "tps": 100.7,
+    "error": ""
+  },
+  {
+    "prompt_key": "short_dui",
+    "category": "short_factual",
+    "tokens": 3072,
+    "time": 28.02,
+    "ttft": 0.079,
+    "tps": 109.6,
+    "error": ""
+  },
+  {
+    "prompt_key": "short_contract",
+    "category": "short_factual",
+    "tokens": 3072,
+    "time": 30.58,
+    "ttft": 0.079,
+    "tps": 100.5,
+    "error": ""
+  },
+  {
+    "prompt_key": "cite_comparative",
+    "category": "citation",
+    "tokens": 3072,
+    "time": 30.95,
+    "ttft": 0.079,
+    "tps": 99.2,
+    "error": ""
+  },
+  {
+    "prompt_key": "cite_broad_form",
+    "category": "citation",
+    "tokens": 3072,
+    "time": 31.75,
+    "ttft": 0.107,
+    "tps": 96.8,
+    "error": ""
+  },
+  {
+    "prompt_key": "cite_summary_judgment",
+    "category": "citation",
+    "tokens": 3072,
+    "time": 30.08,
+    "ttft": 0.107,
+    "tps": 102.1,
+    "error": ""
+  },
+  {
+    "prompt_key": "trick_holographic",
+    "category": "trick",
+    "tokens": 3072,
+    "time": 30.99,
+    "ttft": 0.107,
+    "tps": 99.1,
+    "error": ""
+  },
+  {
+    "prompt_key": "trick_castle",
+    "category": "trick",
+    "tokens": 3072,
+    "time": 30.66,
+    "ttft": 0.106,
+    "tps": 100.2,
+    "error": ""
+  },
+  {
+    "prompt_key": "trick_grandparent",
+    "category": "trick",
+    "tokens": 3072,
+    "time": 30.18,
+    "ttft": 0.135,
+    "tps": 101.8,
+    "error": ""
+  },
+  {
+    "prompt_key": "complex_divorce",
+    "category": "complex_analysis",
+    "tokens": 3072,
+    "time": 31.93,
+    "ttft": 0.135,
+    "tps": 96.2,
+    "error": ""
+  },
+  {
+    "prompt_key": "complex_mineral",
+    "category": "complex_analysis",
+    "tokens": 3072,
+    "time": 33.11,
+    "ttft": 0.134,
+    "tps": 92.8,
+    "error": ""
+  },
+  {
+    "prompt_key": "complex_pi",
+    "category": "complex_analysis",
+    "tokens": 3072,
+    "time": 33.68,
+    "ttft": 0.134,
+    "tps": 91.2,
+    "error": ""
+  },
+  {
+    "prompt_key": "short_statute",
+    "category": "short_factual",
+    "tokens": 3701,
+    "time": 23.33,
+    "ttft": 0.077,
+    "tps": 158.7,
+    "error": ""
+  },
+  {
+    "prompt_key": "cite_comparative",
+    "category": "citation",
+    "tokens": 4096,
+    "time": 27.55,
+    "ttft": 0.083,
+    "tps": 148.7,
+    "error": ""
+  },
+  {
+    "prompt_key": "trick_holographic",
+    "category": "trick",
+    "tokens": 4096,
+    "time": 27.16,
+    "ttft": 0.081,
+    "tps": 150.8,
+    "error": ""
+  },
+  {
+    "prompt_key": "complex_divorce",
+    "category": "complex_analysis",
+    "tokens": 4096,
+    "time": 29.23,
+    "ttft": 0.078,
+    "tps": 140.1,
+    "error": ""
+  },
+  {
+    "prompt_key": "messy_eviction",
+    "category": "messy_real_world",
+    "tokens": 4096,
+    "time": 28.67,
+    "ttft": 0.098,
+    "tps": 142.9,
+    "error": ""
+  },
+  {
+    "prompt_key": "employment_age",
+    "category": "specialized",
+    "tokens": 4096,
+    "time": 28.15,
+    "ttft": 0.099,
+    "tps": 145.5,
+    "error": ""
+  },
+  {
+    "prompt_key": "short_statute",
+    "category": "short_factual",
+    "tokens": 3537,
+    "time": 26.78,
+    "ttft": 0.094,
+    "tps": 132.1,
+    "error": ""
+  },
+  {
+    "prompt_key": "short_dui",
+    "category": "short_factual",
+    "tokens": 3431,
+    "time": 24.63,
+    "ttft": 0.094,
+    "tps": 139.3,
+    "error": ""
+  },
+  {
+    "prompt_key": "short_contract",
+    "category": "short_factual",
+    "tokens": 3587,
+    "time": 27.25,
+    "ttft": 0.087,
+    "tps": 131.6,
+    "error": ""
+  },
+  {
+    "prompt_key": "cite_comparative",
+    "category": "citation",
+    "tokens": 4096,
+    "time": 29.98,
+    "ttft": 0.086,
+    "tps": 136.6,
+    "error": ""
+  },
+  {
+    "prompt_key": "cite_broad_form",
+    "category": "citation",
+    "tokens": 4096,
+    "time": 30.78,
+    "ttft": 0.07,
+    "tps": 133.1,
+    "error": ""
+  },
+  {
+    "prompt_key": "cite_summary_judgment",
+    "category": "citation",
+    "tokens": 3684,
+    "time": 27.84,
+    "ttft": 0.069,
+    "tps": 132.3,
+    "error": ""
+  },
+  {
+    "prompt_key": "short_statute",
+    "category": "short_factual",
+    "tokens": 3317,
+    "time": 33.85,
+    "ttft": 0.1,
+    "tps": 98.0,
+    "error": ""
+  },
+  {
+    "prompt_key": "short_dui",
+    "category": "short_factual",
+    "tokens": 4096,
+    "time": 36.83,
+    "ttft": 0.099,
+    "tps": 111.2,
+    "error": ""
+  },
+  {
+    "prompt_key": "short_contract",
+    "category": "short_factual",
+    "tokens": 3631,
+    "time": 36.17,
+    "ttft": 0.099,
+    "tps": 100.4,
+    "error": ""
+  },
+  {
+    "prompt_key": "cite_comparative",
+    "category": "citation",
+    "tokens": 4096,
+    "time": 37.65,
+    "ttft": 0.099,
+    "tps": 108.8,
+    "error": ""
+  },
+  {
+    "prompt_key": "cite_broad_form",
+    "category": "citation",
+    "tokens": 974,
+    "time": 9.91,
+    "ttft": 0.108,
+    "tps": 98.3,
+    "error": ""
+  },
+  {
+    "prompt_key": "cite_summary_judgment",
+    "category": "citation",
+    "tokens": 1026,
+    "time": 9.91,
+    "ttft": 0.107,
+    "tps": 103.6,
+    "error": ""
+  },
+  {
+    "prompt_key": "trick_holographic",
+    "category": "trick",
+    "tokens": 1001,
+    "time": 9.91,
+    "ttft": 0.107,
+    "tps": 101.1,
+    "error": ""
+  },
+  {
+    "prompt_key": "trick_castle",
+    "category": "trick",
+    "tokens": 1077,
+    "time": 9.91,
+    "ttft": 0.107,
+    "tps": 108.7,
+    "error": ""
+  },
+  {
+    "prompt_key": "trick_grandparent",
+    "category": "trick",
+    "tokens": 0,
+    "time": 0.03,
+    "ttft": 0.035,
+    "tps": 0.0,
+    "error": ""
+  },
+  {
+    "prompt_key": "complex_divorce",
+    "category": "complex_analysis",
+    "tokens": 0,
+    "time": 0.04,
+    "ttft": 0.035,
+    "tps": 0.0,
+    "error": ""
+  },
+  {
+    "prompt_key": "complex_mineral",
+    "category": "complex_analysis",
+    "tokens": 0,
+    "time": 0.04,
+    "ttft": 0.035,
+    "tps": 0.0,
+    "error": ""
+  },
+  {
+    "prompt_key": "complex_pi",
+    "category": "complex_analysis",
+    "tokens": 0,
+    "time": 0.03,
+    "ttft": 0.035,
+    "tps": 0.0,
+    "error": ""
+  }
+]

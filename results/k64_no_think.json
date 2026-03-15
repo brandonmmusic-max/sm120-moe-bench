@@ -1,0 +1,138 @@
+[
+  {
+    "users": 1,
+    "output_len": 1000,
+    "system_tps": 100.2,
+    "per_user_tps": 100.2,
+    "total_tokens": 20,
+    "time": 0.2
+  },
+  {
+    "users": 2,
+    "output_len": 1000,
+    "system_tps": 163.7,
+    "per_user_tps": 81.8,
+    "total_tokens": 50,
+    "time": 0.3
+  },
+  {
+    "users": 4,
+    "output_len": 1000,
+    "system_tps": 277.4,
+    "per_user_tps": 69.4,
+    "total_tokens": 99,
+    "time": 0.4
+  },
+  {
+    "users": 1,
+    "output_len": 2000,
+    "system_tps": 103.8,
+    "per_user_tps": 103.8,
+    "total_tokens": 25,
+    "time": 0.2
+  },
+  {
+    "users": 2,
+    "output_len": 2000,
+    "system_tps": 161.5,
+    "per_user_tps": 80.8,
+    "total_tokens": 40,
+    "time": 0.2
+  },
+  {
+    "users": 4,
+    "output_len": 2000,
+    "system_tps": 292.7,
+    "per_user_tps": 73.2,
+    "total_tokens": 102,
+    "time": 0.3
+  },
+  {
+    "users": 1,
+    "output_len": 8000,
+    "system_tps": 114.1,
+    "per_user_tps": 114.1,
+    "total_tokens": 25,
+    "time": 0.2
+  },
+  {
+    "users": 2,
+    "output_len": 8000,
+    "system_tps": 153.0,
+    "per_user_tps": 76.5,
+    "total_tokens": 46,
+    "time": 0.3
+  },
+  {
+    "users": 4,
+    "output_len": 8000,
+    "system_tps": 283.5,
+    "per_user_tps": 70.9,
+    "total_tokens": 95,
+    "time": 0.3
+  },
+  {
+    "users": 1,
+    "output_len": 16000,
+    "system_tps": 104.6,
+    "per_user_tps": 104.6,
+    "total_tokens": 25,
+    "time": 0.2
+  },
+  {
+    "users": 2,
+    "output_len": 16000,
+    "system_tps": 154.9,
+    "per_user_tps": 77.5,
+    "total_tokens": 45,
+    "time": 0.3
+  },
+  {
+    "users": 4,
+    "output_len": 16000,
+    "system_tps": 287.9,
+    "per_user_tps": 72.0,
+    "total_tokens": 101,
+    "time": 0.4
+  },
+  {
+    "users": 1,
+    "output_len": 32000,
+    "system_tps": 96.2,
+    "per_user_tps": 96.2,
+    "total_tokens": 25,
+    "time": 0.3
+  },
+  {
+    "users": 2,
+    "output_len": 32000,
+    "system_tps": 151.9,
+    "per_user_tps": 75.9,
+    "total_tokens": 44,
+    "time": 0.3
+  },
+  {
+    "users": 4,
+    "output_len": 32000,
+    "system_tps": 285.5,
+    "per_user_tps": 71.4,
+    "total_tokens": 102,
+    "time": 0.4
+  },
+  {
+    "users": 8,
+    "output_len": 1000,
+    "system_tps": 388.3,
+    "per_user_tps": 48.5,
+    "total_tokens": 192,
+    "time": 0.5
+  },
+  {
+    "users": 16,
+    "output_len": 1000,
+    "system_tps": 480.2,
+    "per_user_tps": 30.0,
+    "total_tokens": 394,
+    "time": 0.8
+  }
+]
