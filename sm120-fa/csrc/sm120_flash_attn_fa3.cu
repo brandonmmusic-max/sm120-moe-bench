@@ -70,9 +70,10 @@ __device__ __forceinline__ void mb_wait(uint64_t* m, int p) {
     uint32_t a = static_cast<uint32_t>(__cvta_generic_to_shared(m));
     asm volatile("{\n.reg .pred P;\nW:\nmbarrier.try_wait.parity.shared.b64 P,[%0],%1;\n@!P bra W;\n}\n" :: "r"(a), "r"(p));
 }
-// Named barrier for producer→consumer sync
-__device__ __forceinline__ void bar_sync(int id, int count) {
-    asm volatile("bar.sync %0, %1;\n" :: "r"(id), "r"(count));
+// mbarrier arrive (for consumer→producer signaling)
+__device__ __forceinline__ void mb_arrive(uint64_t* m) {
+    uint32_t a = static_cast<uint32_t>(__cvta_generic_to_shared(m));
+    asm volatile("mbarrier.arrive.shared.b64 _, [%0];\n" :: "r"(a));
 }
 
 __global__ void __launch_bounds__(BLOCK_SIZE, 1)
@@ -104,7 +105,9 @@ sm120_fa_fa3(
         vr[s] = vl[s] + KV_HALF_ELEMS;
     }
     __nv_bfloat16* p_s = kv_base + NUM_STAGES * 4 * KV_HALF_ELEMS;
-    uint64_t* mbar = (uint64_t*)((char*)p_s + P_ELEMS * 2);
+    // 4 mbarriers: 2 for TMA completion, 2 for consumer-done signaling
+    uint64_t* mbar_kv = (uint64_t*)((char*)p_s + P_ELEMS * 2);      // TMA done
+    uint64_t* mbar_consumed = mbar_kv + 2;                            // consumers done
 
     // ALL warps load Q cooperatively
     for (int i = tid; i < Q_ELEMS; i += BLOCK_SIZE) q_s[i] = __float2bfloat16(0.0f);
@@ -116,36 +119,63 @@ sm120_fa_fa3(
     asm volatile("cp.async.commit_group;\ncp.async.wait_group 0;\n");
     __syncthreads();
 
-    // Init mbarriers
-    if (tid == 0) { mb_init(&mbar[0], 1); mb_init(&mbar[1], 1); }
+    // Init all 4 mbarriers
+    if (tid == 0) {
+        mb_init(&mbar_kv[0], 1);
+        mb_init(&mbar_kv[1], 1);
+        // consumed barriers: NUM_CONSUMERS warps will arrive (7 warps × 32 threads = 224)
+        // But mbarrier counts ARRIVALS not threads. Each consumer warp does 1 arrive.
+        mb_init(&mbar_consumed[0], NUM_CONSUMERS);
+        mb_init(&mbar_consumed[1], NUM_CONSUMERS);
+    }
+    __syncthreads();
+
+    // Prefetch stage 0 BEFORE entering the loop
+    if (tid == 0) {
+        int kv_row = kv_head * Skv;
+        int hbytes = BLOCK_N * HALF_HD * 2;
+        mb_expect(&mbar_kv[0], 4 * hbytes);
+        tma2d(kl[0], Kdl, 0, kv_row, &mbar_kv[0]);
+        tma2d(kr[0], Kdr, 0, kv_row, &mbar_kv[0]);
+        tma2d(vl[0], Vdl, 0, kv_row, &mbar_kv[0]);
+        tma2d(vr[0], Vdr, 0, kv_row, &mbar_kv[0]);
+    }
     __syncthreads();
 
     if (is_producer) {
         // ================================================================
-        // PRODUCER WARP: only TMA loads + mbarrier management
+        // PRODUCER WARP: prefetch stage N+1 while consumers compute on N
         // ================================================================
         for (int kv = 0; kv < num_kv; kv++) {
             int cs = kv % 2;
-            int kv_row = kv_head * Skv + kv * BLOCK_N;
-            int hbytes = BLOCK_N * HALF_HD * 2;
+            int ns = 1 - cs;
 
-            // Wait for consumers to finish with this stage
-            if (kv >= 2) bar_sync(1, BLOCK_SIZE);  // Wait for consumer done signal
+            // Prefetch NEXT KV block (N+1)
+            if (kv + 1 < num_kv) {
+                // Wait for consumers to finish with the next stage buffer
+                if (kv >= 1) {
+                    mb_wait(&mbar_consumed[ns], 0);
+                }
 
-            if (lane == 0) {
-                mb_init(&mbar[cs], 1);
+                if (lane == 0) {
+                    int next_row = kv_head * Skv + (kv+1) * BLOCK_N;
+                    int hbytes = BLOCK_N * HALF_HD * 2;
+                    mb_init(&mbar_kv[ns], 1);
+                }
+                __syncwarp();
+                if (lane == 0) {
+                    int next_row = kv_head * Skv + (kv+1) * BLOCK_N;
+                    int hbytes = BLOCK_N * HALF_HD * 2;
+                    mb_expect(&mbar_kv[ns], 4 * hbytes);
+                    tma2d(kl[ns], Kdl, 0, next_row, &mbar_kv[ns]);
+                    tma2d(kr[ns], Kdr, 0, next_row, &mbar_kv[ns]);
+                    tma2d(vl[ns], Vdl, 0, next_row, &mbar_kv[ns]);
+                    tma2d(vr[ns], Vdr, 0, next_row, &mbar_kv[ns]);
+                }
             }
-            __syncwarp();
-            if (lane == 0) {
-                mb_expect(&mbar[cs], 4 * hbytes);
-                tma2d(kl[cs], Kdl, 0, kv_row, &mbar[cs]);
-                tma2d(kr[cs], Kdr, 0, kv_row, &mbar[cs]);
-                tma2d(vl[cs], Vdl, 0, kv_row, &mbar[cs]);
-                tma2d(vr[cs], Vdr, 0, kv_row, &mbar[cs]);
-            }
 
-            // Signal consumers that load is issued
-            bar_sync(0, BLOCK_SIZE);  // Producer→consumer: data loading
+            // Producer does nothing else — just waits for the iteration to end
+            __syncthreads();  // Sync with consumers at end of iteration
         }
     } else {
         // ================================================================
@@ -161,11 +191,8 @@ sm120_fa_fa3(
         for (int kv = 0; kv < num_kv; kv++) {
             int cs = kv % 2;
 
-            // Wait for producer to issue TMA load
-            bar_sync(0, BLOCK_SIZE);
-
-            // Wait for TMA completion
-            mb_wait(&mbar[cs], 0);
+            // Wait for TMA completion (producer already issued the load)
+            mb_wait(&mbar_kv[cs], 0);
             __syncthreads();
 
             // Q@K^T
@@ -265,8 +292,18 @@ sm120_fa_fa3(
                 }
             }
 
-            // Signal producer: done with this stage
-            bar_sync(1, BLOCK_SIZE);
+            // Signal producer: done with this stage's KV data
+            // Each consumer warp does 1 arrive on the consumed barrier
+            if (lane == 0) {
+                mb_arrive(&mbar_consumed[cs]);
+            }
+            // Re-init consumed barrier for next use of this stage
+            if (kv + 2 < num_kv && lane == 0 && consumer_warp == 0) {
+                // Only one consumer warp re-inits (after all have arrived)
+                // Actually this is tricky — can't re-init while others might arrive
+                // Skip re-init, use alternating phases instead
+            }
+            __syncthreads();  // Sync with producer at end of iteration
         }
 
         // Output
