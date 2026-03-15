@@ -167,6 +167,11 @@ sm120_flash_attn_fwd_bf16(
     v_s[1] = k_s[1] + KV_ELEMS;
     __nv_bfloat16* p_s = v_s[1] + KV_ELEMS;  // P staging buffer
 
+    // Zero-fill Q SMEM first (for partial tiles at sequence end)
+    for (int i = tid; i < Q_ELEMS; i += BLOCK_SIZE)
+        q_s[i] = __float2bfloat16(0.0f);
+    __syncthreads();
+
     // Load Q to SMEM
     for (int i = tid; i < Q_ELEMS / 8; i += BLOCK_SIZE) {
         int row = (i * 8) / HEAD_DIM;
@@ -197,6 +202,12 @@ sm120_flash_attn_fwd_bf16(
     // KV loop
     const int num_kv = (Skv + BLOCK_N - 1) / BLOCK_N;
 
+    // Persistent zero buffer in SMEM for zero-fill cp_async source
+    // (cp_async needs a valid source address — use SMEM itself)
+    __shared__ __nv_bfloat16 zero_buf[8];  // 16 bytes of zeros
+    if (tid < 8) zero_buf[tid] = __float2bfloat16(0.0f);
+    __syncthreads();
+
     auto load_kv = [&](int blk, int stage) {
         int ns = blk * BLOCK_N;
         for (int i = tid; i < KV_ELEMS / 8; i += BLOCK_SIZE) {
@@ -206,6 +217,13 @@ sm120_flash_attn_fwd_bf16(
             if (kvr < Skv) {
                 cp_async_16B(&k_s[stage][row * HEAD_DIM + col], &k_ptr[kvr * HEAD_DIM + col]);
                 cp_async_16B(&v_s[stage][row * HEAD_DIM + col], &v_ptr[kvr * HEAD_DIM + col]);
+            } else {
+                // Zero-fill via cp_async from our zero buffer (SMEM→SMEM not valid)
+                // Use regular store instead — cp_async_commit will wait for these too
+                for (int j = 0; j < 8; j++) {
+                    k_s[stage][(row * HEAD_DIM + col) + j] = __float2bfloat16(0.0f);
+                    v_s[stage][(row * HEAD_DIM + col) + j] = __float2bfloat16(0.0f);
+                }
             }
         }
         cp_async_commit();
@@ -262,13 +280,20 @@ sm120_flash_attn_fwd_bf16(
             }
         }
 
-        // Apply scale
+        // Apply scale and mask invalid KV positions to -INF
+        int kv_start = kv * BLOCK_N;
         #pragma unroll
         for (int rh = 0; rh < 2; rh++)
             #pragma unroll
             for (int nt = 0; nt < 8; nt++) {
                 s_acc[rh][nt][0] *= scale;
                 s_acc[rh][nt][1] *= scale;
+                // Each thread owns score columns: nt*MMA_N + t*2 and +1
+                // Global KV indices: kv_start + nt*8 + t*2 and +1
+                int kv_idx0 = kv_start + nt * MMA_N + t * 2;
+                int kv_idx1 = kv_idx0 + 1;
+                if (kv_idx0 >= Skv) s_acc[rh][nt][0] = -FLT_MAX;
+                if (kv_idx1 >= Skv) s_acc[rh][nt][1] = -FLT_MAX;
             }
 
         // ================================================================
