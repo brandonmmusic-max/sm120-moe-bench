@@ -213,58 +213,68 @@ sm120_fa_v4(
                 s_acc[rh][nt][0] = s_acc[rh][nt][1] = 0;
 
         // ki=0,1,2: preloaded Q, K left half
+        // Software-pipelined: prefetch K[ni+1] before MMA[ni]
         #pragma unroll
         for (int ki = 0; ki < 3; ki++) {
             uint32_t (&qf)[4] = qf_pre[ki];
             int lc = ki * MMA_K;
-            #pragma unroll
-            for (int ni = 0; ni < BLOCK_N/MMA_N; ni++) {
-                uint32_t kf[2];
+            // Prefetch first K fragment
+            uint32_t kf[2], kf_next[2];
+            {
                 uint32_t k_addr = static_cast<uint32_t>(
-                    __cvta_generic_to_shared(&KL(cs)[tma_sw(ni*MMA_N+ldm_k_lane_row, lc+ldm_k_col_off, KV_HALF_STRIDE)]));
+                    __cvta_generic_to_shared(&KL(cs)[tma_sw(ldm_k_lane_row, lc+ldm_k_col_off, KV_HALF_STRIDE)]));
                 ldmatrix_x2(kf, k_addr);
+            }
+            #pragma unroll
+            for (int ni = 0; ni < BLOCK_N/MMA_N - 1; ni++) {
+                // Prefetch K[ni+1] BEFORE executing MMA[ni]
+                uint32_t k_addr_next = static_cast<uint32_t>(
+                    __cvta_generic_to_shared(&KL(cs)[tma_sw((ni+1)*MMA_N+ldm_k_lane_row, lc+ldm_k_col_off, KV_HALF_STRIDE)]));
+                ldmatrix_x2(kf_next, k_addr_next);
+                // Execute MMA with current K fragment
+                float tl[4] = {s_acc[0][ni][0], s_acc[0][ni][1], s_acc[1][ni][0], s_acc[1][ni][1]};
+                mma16(tl, qf, kf);
+                s_acc[0][ni][0]=tl[0]; s_acc[0][ni][1]=tl[1]; s_acc[1][ni][0]=tl[2]; s_acc[1][ni][1]=tl[3];
+                kf[0] = kf_next[0]; kf[1] = kf_next[1];
+            }
+            // Last ni: no prefetch needed
+            {
+                int ni = BLOCK_N/MMA_N - 1;
                 float tl[4] = {s_acc[0][ni][0], s_acc[0][ni][1], s_acc[1][ni][0], s_acc[1][ni][1]};
                 mma16(tl, qf, kf);
                 s_acc[0][ni][0]=tl[0]; s_acc[0][ni][1]=tl[1]; s_acc[1][ni][0]=tl[2]; s_acc[1][ni][1]=tl[3];
             }
         }
 
-        // ki=3: reload Q from SMEM (last of K left half)
-        {
-            uint32_t qf[4];
-            int q_col = 3 * MMA_K + ldm_q_col_base;
-            uint32_t q_addr = static_cast<uint32_t>(
-                __cvta_generic_to_shared(&q_s[q_sw(ldm_q_row, q_col, Q_STRIDE)]));
-            ldmatrix_x4(qf, q_addr);
-            int lc = 3 * MMA_K;
-            #pragma unroll
-            for (int ni = 0; ni < BLOCK_N/MMA_N; ni++) {
-                uint32_t kf[2];
-                uint32_t k_addr = static_cast<uint32_t>(
-                    __cvta_generic_to_shared(&KL(cs)[tma_sw(ni*MMA_N+ldm_k_lane_row, lc+ldm_k_col_off, KV_HALF_STRIDE)]));
-                ldmatrix_x2(kf, k_addr);
-                float tl[4] = {s_acc[0][ni][0], s_acc[0][ni][1], s_acc[1][ni][0], s_acc[1][ni][1]};
-                mma16(tl, qf, kf);
-                s_acc[0][ni][0]=tl[0]; s_acc[0][ni][1]=tl[1]; s_acc[1][ni][0]=tl[2]; s_acc[1][ni][1]=tl[3];
-            }
-        }
-
-        // ki=4..7: reload Q from SMEM (recompute addrs), K right half
+        // ki=3..7: reload Q, software-pipelined K loads
         #pragma unroll
-        for (int ki = 4; ki < 8; ki++) {
+        for (int ki = 3; ki < 8; ki++) {
             uint32_t qf[4];
-            // OPT 4: Recompute address on the fly (INT pipe, free)
             int q_col = ki * MMA_K + ldm_q_col_base;
             uint32_t q_addr = static_cast<uint32_t>(
                 __cvta_generic_to_shared(&q_s[q_sw(ldm_q_row, q_col, Q_STRIDE)]));
             ldmatrix_x4(qf, q_addr);
-            int lc = (ki - 4) * MMA_K;
+            __nv_bfloat16* kh = (ki < 4) ? KL(cs) : KR(cs);
+            int lc = (ki < 4) ? ki * MMA_K : (ki - 4) * MMA_K;
+            // Prefetch first K
+            uint32_t kf[2], kf_next[2];
+            {
+                uint32_t ka = static_cast<uint32_t>(
+                    __cvta_generic_to_shared(&kh[tma_sw(ldm_k_lane_row, lc+ldm_k_col_off, KV_HALF_STRIDE)]));
+                ldmatrix_x2(kf, ka);
+            }
             #pragma unroll
-            for (int ni = 0; ni < BLOCK_N/MMA_N; ni++) {
-                uint32_t kf[2];
-                uint32_t k_addr = static_cast<uint32_t>(
-                    __cvta_generic_to_shared(&KR(cs)[tma_sw(ni*MMA_N+ldm_k_lane_row, lc+ldm_k_col_off, KV_HALF_STRIDE)]));
-                ldmatrix_x2(kf, k_addr);
+            for (int ni = 0; ni < BLOCK_N/MMA_N - 1; ni++) {
+                uint32_t ka_next = static_cast<uint32_t>(
+                    __cvta_generic_to_shared(&kh[tma_sw((ni+1)*MMA_N+ldm_k_lane_row, lc+ldm_k_col_off, KV_HALF_STRIDE)]));
+                ldmatrix_x2(kf_next, ka_next);
+                float tl[4] = {s_acc[0][ni][0], s_acc[0][ni][1], s_acc[1][ni][0], s_acc[1][ni][1]};
+                mma16(tl, qf, kf);
+                s_acc[0][ni][0]=tl[0]; s_acc[0][ni][1]=tl[1]; s_acc[1][ni][0]=tl[2]; s_acc[1][ni][1]=tl[3];
+                kf[0] = kf_next[0]; kf[1] = kf_next[1];
+            }
+            {
+                int ni = BLOCK_N/MMA_N - 1;
                 float tl[4] = {s_acc[0][ni][0], s_acc[0][ni][1], s_acc[1][ni][0], s_acc[1][ni][1]};
                 mma16(tl, qf, kf);
                 s_acc[0][ni][0]=tl[0]; s_acc[0][ni][1]=tl[1]; s_acc[1][ni][0]=tl[2]; s_acc[1][ni][1]=tl[3];
