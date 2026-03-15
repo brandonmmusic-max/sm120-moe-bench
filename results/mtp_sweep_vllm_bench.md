@@ -153,4 +153,43 @@ At 8 concurrent users, all MTP configs scale similarly (~3.6x system throughput 
 4. Install benchmark tool: `pip install vllm[bench]`
 5. Run benchmarks: `bash configs/benchmark_mtp_sweep.sh` (edit TOKENIZER path first)
 
+## Appendix: Thinking Mode (Chat Completions) Impact
+
+Using `--backend openai-chat --endpoint /v1/chat/completions` with the same random prompts triggers the chat template and reasoning/thinking token generation. This significantly impacts MTP speculative decoding efficiency.
+
+### Benchmark Command (thinking-enabled)
+
+```bash
+vllm bench serve \
+  --backend openai-chat --base-url http://localhost:9200 \
+  --model qwen3.5-397b-nvfp4 \
+  --tokenizer /path/to/sehyo-qwen35-nvfp4 \
+  --endpoint /v1/chat/completions \
+  --dataset-name random --random-input-len 128 --random-output-len 256 \
+  --num-prompts 50 --max-concurrency 1 \
+  --request-rate inf --num-warmups 5 --temperature 0
+```
+
+### Completions vs Chat (Thinking) — MTP=3
+
+| Metric | Completions | Chat (thinking) | Delta |
+|--------|-------------|-----------------|-------|
+| Single-user output tok/s | 172 | **151** | -12% |
+| 8-user system output tok/s | 625 | **577** | -8% |
+| Single-user acceptance rate | 79.0% | 66.7% | -12pp |
+| 8-user acceptance rate | 75.3% | 65.3% | -10pp |
+| Position 0 accept (1-user) | 89.0% | 86.1% | -3pp |
+| Position 1 accept (1-user) | 78.7% | 67.0% | -12pp |
+| Position 2 accept (1-user) | 69.3% | **47.1%** | -22pp |
+
+### Analysis
+
+Thinking/reasoning tokens are harder for MTP heads to predict. Position 2 acceptance drops from 69% to 47% — nearly a coin flip. This suggests the internal reasoning chain has higher entropy than standard text completion, making speculative decoding less effective.
+
+The throughput impact is moderate (-8% to -12%) because:
+1. The MTP heads still provide value at positions 0 and 1 (86% and 67% acceptance)
+2. The overhead of rejected drafts is partially offset by accepted tokens at earlier positions
+
+For production chat/agent workloads with thinking enabled, expect ~150 tok/s single-user and ~577 tok/s at 8 concurrent users. MTP=3 remains the best choice — MTP=2 would likely perform similarly since position 2 is barely above random.
+
 Date: 2026-03-15
