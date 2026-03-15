@@ -90,6 +90,9 @@ Custom Flash Attention kernel built from scratch for SM120 (RTX PRO 6000 Blackwe
 | **v2.0 ldmatrix + register-P** | **190** | **83%** | 174 |
 | **v2.1 + BN128 + Q-preload** | **216** | **90%** | 254 |
 | **v3.0 const-mem + DS + auto-dispatch** | **237** (Sq=2K) | **105% BEATS cuDNN** | 238/251 |
+| **v4.0 DS + per-warp mbarrier** | **242** | **102% BEATS cuDNN** | 229, 80B stack |
+| **v4.1 reg-optimized (current)** | **251** | **104% BEATS cuDNN** | 223, 0 stack |
+| **4-GPU P2P (Sq=131K)** | **679** | **304% BEATS cuDNN** | — |
 
 ### Architecture (v3)
 
@@ -115,43 +118,54 @@ Two kernel variants with auto-dispatch:
 - **Q preload:** All 8 Q fragments (32 regs) loaded before KV loop
 - **Output:** Vectorized uint32_t stores (halves store instruction count)
 
-### SM120 FA v3 vs cuDNN SDPA Benchmark
+### SM120 FA v4.1 vs cuDNN SDPA Benchmark (Single GPU)
 
 RTX PRO 6000 Blackwell (96GB, SM 12.0, 300W), BF16, non-causal, GQA Hq=32 Hkv=8:
 
-| Sequence Length | SM120-FA v3 | cuDNN SDPA | Ratio | |
+| Sequence Length | SM120-FA v4.1 | cuDNN SDPA | Ratio |
+|---|---|---|---|
+| 512 | **162 TF** | 99 TF | **163% BEATS** |
+| 1,024 | 195 TF | 199 TF | 98% |
+| **2,048** | **231 TF** | 226 TF | **102% BEATS** |
+| **4,096** | **235 TF** | 226 TF | **104% BEATS** |
+| **8,192** | **246 TF** | 238 TF | **103% BEATS** |
+| **16,384** | **251 TF** | 241 TF | **104% BEATS** |
+
+| Config | SM120-FA v4.1 | cuDNN | Ratio |
+|---|---|---|---|
+| **B=2, Sq=2048** | **229 TF** | 217 TF | **105% BEATS** |
+| **B=4, Sq=2048** | **232 TF** | 221 TF | **105% BEATS** |
+| **GQA 8:1 (Hq=64), Sq=2048** | **229 TF** | 216 TF | **106% BEATS** |
+
+### Multi-GPU Sequence-Parallel (4x RTX PRO 6000, P2P)
+
+| Sequence Length | Single GPU | cuDNN | **4-GPU P2P** | **vs cuDNN** |
 |---|---|---|---|---|
-| 512 | **154 TF** | 100 TF | **155% BEATS** | DS |
-| 1,024 | 190 TF | 200 TF | 95% | DS |
-| **2,048** | **237 TF** | 226 TF | **105% BEATS** | DS |
-| 4,096 | 209 TF | 227 TF | 92% | SS |
-| 8,192 | 216 TF | 240 TF | 90% | SS |
-| 16,384 | 218 TF | 243 TF | 90% | SS |
+| 4,096 | 247 TF | 228 TF | 92 TF | 0.40x |
+| 8,192 | 239 TF | 228 TF | 157 TF | 0.69x |
+| **16,384** | 239 TF | 232 TF | **263 TF** | **1.13x** |
+| **32,768** | 233 TF | 230 TF | **410 TF** | **1.78x** |
+| **65,536** | 233 TF | 224 TF | **570 TF** | **2.55x** |
+| **131,072** | 227 TF | 223 TF | **679 TF** | **3.04x** |
 
-| Config | SM120-FA v3 | cuDNN | Ratio | |
-|---|---|---|---|---|
-| **B=2, Sq=2048** | **223 TF** | 217 TF | **103% BEATS** | DS |
-| **B=4, Sq=2048** | **226 TF** | 221 TF | **102% BEATS** | DS |
-| MHA (Hq=Hkv=32), Sq=4096 | 204 TF | 225 TF | 91% | SS |
-| **GQA 8:1 (Hq=64), Sq=2048** | **223 TF** | 216 TF | **103% BEATS** | DS |
+Crossover point: ~Sq=16K. At 131K context, 4-GPU P2P achieves 2.99x single-GPU scaling and 3.04x vs cuDNN.
 
-### NCU Profiling Analysis (SS kernel, Sq=8192)
+### NCU Profiling Analysis (v4.1 reg-optimized, Sq=8192)
 
-| Metric | Value | Notes |
-|---|---|---|
-| Theoretical Occupancy | 16.67% | 1 block/SM (limited by regs AND SMEM) |
-| Achieved Occupancy | 16.65% | Fully achieving theoretical |
-| Registers/thread | 251 | Block limit: 1 (need ≤128 for 2 blocks) |
-| SMEM/block | 98.4 KB | Block limit: 1 (need ≤50KB for 2 blocks) |
-| Tensor pipe utilization | 65.7% | Highest-utilized pipe, well-utilized |
-| Active warps/scheduler | 2.00 | Max possible at 16.67% occupancy |
-| Eligible warps/scheduler | 0.33 | Main bottleneck — warps stall waiting for MMA |
-| Compute throughput | 65.7% | |
-| L1/TEX throughput | 34.9% | Down from 84% pre-ldmatrix |
-| DRAM throughput | 1.5% | Fully compute-bound |
-| Issue rate | 0.95 IPC | 1 instruction every 4.2 cycles |
+| Metric | v3 SS (old) | **v4.1 (current)** | Change |
+|---|---|---|---|
+| Compute Throughput | 65.7% | **83.6%** | **+27%** |
+| Tensor Pipe | 65.7% | **83.6%** | **+27%** |
+| IPC | 0.95 | **1.19** | **+25%** |
+| Eligible Warps/Scheduler | 0.33 | **0.42** | **+27%** |
+| L1/TEX Hit Rate | 94.5% (local mem) | **58.3%** (real loads) | Fixed |
+| Registers | 251 | **223** | -28 |
+| Stack Frame | 80B | **0B** | **Eliminated** |
+| Math Pipe Stall | 36.9% | 41.2% | More useful MMA work |
+| Duration (Sq=8192) | 4.18ms | **4.09ms** | **-2.2%** |
+| Occupancy | 16.67% | 16.67% | Same (regs + SMEM limited) |
 
-**Bottleneck:** Low occupancy (16.67%) means only 0.33 eligible warps per cycle — most time is spent stalled waiting for the tensor pipe. The remaining gap to cuDNN (~10% at long sequences) is primarily an occupancy and instruction scheduling limitation, not memory bandwidth.
+**Bottleneck:** Tensor pipe at 83.6% is near-saturated at 16.67% occupancy. The kernel is fully compute-bound (DRAM 1.8%, L2 hit 98.2%). Remaining speedup opportunities per NCU: 25% from SMEM access patterns, 16% from occupancy (requires <128 regs), 5% from FP32 fma fusion.
 
 ### Key Discoveries
 
