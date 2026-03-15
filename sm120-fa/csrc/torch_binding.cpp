@@ -106,9 +106,64 @@ std::vector<torch::Tensor> sm120_flash_attn_fwd(
     return {O};
 }
 
+// Forward declaration of selective attention
+extern "C" void sm120_selective_attn_forward(
+    const __nv_bfloat16* Q, const __nv_bfloat16* K, const __nv_bfloat16* V,
+    __nv_bfloat16* O, float* L,
+    int batch, int Hq, int Hkv, int Sq, int Skv, int head_dim,
+    int block_size, int top_k, int local_window, int max_selected,
+    cudaStream_t stream
+);
+
+std::vector<torch::Tensor> sm120_selective_fwd(
+    torch::Tensor Q, torch::Tensor K, torch::Tensor V,
+    int block_size, int top_k, int local_window, int max_selected
+) {
+    TORCH_CHECK(Q.is_cuda() && K.is_cuda() && V.is_cuda());
+    TORCH_CHECK(Q.dtype() == torch::kBFloat16);
+    TORCH_CHECK(Q.is_contiguous() && K.is_contiguous() && V.is_contiguous());
+    TORCH_CHECK(Q.dim() == 4);
+
+    const int batch = Q.size(0);
+    const int num_q_heads = Q.size(1);
+    const int seq_len_q = Q.size(2);
+    const int head_dim = Q.size(3);
+    const int num_kv_heads = K.size(1);
+    const int seq_len_kv = K.size(2);
+
+    auto O = torch::empty_like(Q);
+    auto Q_flat = Q.reshape({batch * num_q_heads, seq_len_q, head_dim});
+    auto K_flat = K.reshape({batch * num_kv_heads, seq_len_kv, head_dim});
+    auto V_flat = V.reshape({batch * num_kv_heads, seq_len_kv, head_dim});
+    auto O_flat = O.reshape({batch * num_q_heads, seq_len_q, head_dim});
+
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+
+    sm120_selective_attn_forward(
+        reinterpret_cast<const __nv_bfloat16*>(Q_flat.data_ptr()),
+        reinterpret_cast<const __nv_bfloat16*>(K_flat.data_ptr()),
+        reinterpret_cast<const __nv_bfloat16*>(V_flat.data_ptr()),
+        reinterpret_cast<__nv_bfloat16*>(O_flat.data_ptr()),
+        nullptr,
+        batch, num_q_heads, num_kv_heads,
+        seq_len_q, seq_len_kv, head_dim,
+        block_size, top_k, local_window, max_selected,
+        stream
+    );
+
+    return {O};
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("forward", &sm120_flash_attn_fwd,
           "SM120 Flash Attention forward (BF16)",
           py::arg("Q"), py::arg("K"), py::arg("V"),
           py::arg("return_lse") = false);
+    m.def("forward_selective", &sm120_selective_fwd,
+          "SM120 Selective Attention forward (BF16, approximate)",
+          py::arg("Q"), py::arg("K"), py::arg("V"),
+          py::arg("block_size") = 64,
+          py::arg("top_k") = 8,
+          py::arg("local_window") = 2,
+          py::arg("max_selected") = 16);
 }

@@ -20,6 +20,7 @@ setup(
             sources=[
                 "csrc/torch_binding.cpp",
                 "csrc/sm120_flash_attn.cu",
+                "csrc/sm120_selective_attn.cu",
             ],
             extra_compile_args={
                 "cxx": ["-O3", "-std=c++17"],
