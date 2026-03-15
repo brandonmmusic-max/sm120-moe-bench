@@ -206,8 +206,9 @@ docker exec -it your-container python3 /patches/apply_patches.py
 3. **CUDA graphs are essential** — `--enforce-eager` drops decode from 139→40 tok/s (-71%). Kernel launch overhead dominates without graphs. Full analysis: [results/enforce_eager_analysis.md](results/enforce_eager_analysis.md)
 4. **PCIe link width matters** — one GPU at x4 instead of x16 bottlenecks all TP allreduce operations; reseat cards if `lspci` shows degraded width
 5. **Prompt complexity affects throughput** — complex multi-factor legal analysis runs 30-40% slower than specialized prompts due to MoE expert routing diversity. Full analysis: [results/klc_analysis.md](results/klc_analysis.md)
-6. **MTP inflates API-level numbers** — engine throughput (~139 tok/s) is the honest metric; API-level with think tokens shows ~283 tok/s
-7. **EP (Expert Parallelism) doesn't work on 4x96GB** — TP=2 EP=2 leaves 0 GiB for KV cache after model weights (62.5 GiB/GPU with TP=2). TP=4 is the correct config for this model on 4 GPUs
+6. **MTP=3 beats MTP=5 for most workloads** — MTP=3 is 5-11% faster at short-medium contexts and high concurrency. MTP=5 only wins at 32K+ context where saving attention passes justifies extra speculation overhead. Full analysis: [results/mtp3_vs_mtp5_analysis.md](results/mtp3_vs_mtp5_analysis.md)
+7. **MTP inflates API-level numbers** — engine throughput (~139 tok/s) is the honest metric; API-level with think tokens shows ~283 tok/s
+8. **EP (Expert Parallelism) doesn't work on 4x96GB** — TP=2 EP=2 leaves 0 GiB for KV cache after model weights (62.5 GiB/GPU with TP=2). TP=4 is the correct config for this model on 4 GPUs
 
 ## Files
 
