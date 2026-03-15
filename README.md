@@ -75,6 +75,72 @@ docker run -d --name vllm --gpus all --ipc host --shm-size 32g \
 - **Threadripper:** Without `iommu=pt`, you MUST set `NCCL_P2P_DISABLE=1` to avoid IO_PAGE_FAULT
 - **First startup:** Blackwell JIT compilation takes ~20 min on first run
 
+## SM120-Native Flash Attention Kernel
+
+Custom Flash Attention kernel built from scratch for SM120 (RTX PRO 6000 Blackwell). No FA3/FA4 exists for SM120 — it lacks tcgen05/TMEM, so vLLM falls back to FA2 (SM80 path via cuDNN). This kernel is SM120-native and closes the gap.
+
+### Key Optimizations
+
+| Optimization | TFLOPS (Sq=16K) | % of cuDNN | Registers |
+|---|---|---|---|
+| v2 scalar baseline | 0.3 | — | — |
+| v3 MMA (fragment layout fixed) | 54 | 24% | — |
+| v5 XOR swizzle | 99 | 43% | — |
+| v1.0 BM128+BN64 single-stage | 117 | 51% | 247 |
+| **v2.0 ldmatrix + register-P** | **190** | **83%** | 174 |
+| **v2.1 + BN128 + Q-preload** | **216** | **90%** | 254 |
+
+### Architecture
+
+- **MMA:** `mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32` (SM120 uses SM80-era MMA, not wgmma)
+- **Tiles:** BM=128, BN=128, HD=128, 8 warps (256 threads)
+- **SMEM:** Q(32KB) + K(32KB) + V(32KB) = 96KB, no P buffer (register-resident)
+- **TMA:** Split-HD SWIZZLE_128B (64-elem halves, hardware swizzle)
+- **Loads:** `ldmatrix.x4` for Q, `ldmatrix.x2` for K, `ldmatrix.x2.trans` for V
+- **P@V:** Softmax output stays in registers — `s_acc[rh][ki*2+j][ei]` maps directly to MMA A fragment
+- **Q preload:** All 8 Q fragments (32 regs) loaded before KV loop — zero Q SMEM access in hot path
+- **Sync:** mbarrier phase tracking with prefetch, 1 `__syncthreads` per iteration (down from 3)
+
+### SM120 FA vs cuDNN SDPA Benchmark
+
+RTX PRO 6000 Blackwell (96GB, SM 12.0, 300W), BF16, non-causal, GQA Hq=32 Hkv=8:
+
+| Sequence Length | SM120-FA | cuDNN SDPA | Ratio |
+|---|---|---|---|
+| 1,024 | 70 TF | 200 TF | 35% |
+| 2,048 | 155 TF | 247 TF | 63% |
+| 4,096 | 196 TF | 227 TF | 86% |
+| 8,192 | 211 TF | 238 TF | 89% |
+| **16,384** | **216 TF** | **240 TF** | **90%** |
+
+| Config | SM120-FA | cuDNN | Ratio |
+|---|---|---|---|
+| B=2, Sq=2048 | 176 TF | 217 TF | 81% |
+| B=4, Sq=2048 | 185 TF | 219 TF | 84% |
+| MHA (Hq=Hkv=32), Sq=4096 | 189 TF | 224 TF | 85% |
+| GQA 8:1 (Hq=64), Sq=2048 | 175 TF | 216 TF | 81% |
+
+### Key Discoveries
+
+- **MMA m16n8k16 fragment layout** (undocumented for SM120): A registers are interleaved row/row+8, NOT k/k+8. Ra0=[g,2t], Ra1=[g+8,2t], Ra2=[g,2t+8], Ra3=[g+8,2t+8]
+- **ldmatrix is the single biggest optimization** — 62% speedup (117→190 TF) by replacing manual `pk()` SMEM loads with `ldmatrix.x4`/`ldmatrix.x2`
+- **V needs `ldmatrix.trans`** — V's B fragment indexes rows by t (not g), requiring hardware transpose
+- **FA3-style warp specialization hurts on SM120** — losing 1/8 compute to producer warp > overlap benefit
+- **Single-stage > double-stage** — pipeline stall penalty exceeds memory overlap benefit on SM120
+- **Register-resident P** saves 16KB SMEM round-trip but only ~5% of total SMEM loads; ldmatrix is what matters
+
+### Selective Attention (Decode)
+
+Block-summary routing with mean(K_block) achieves 99.2% raw score recall. Beats cuDNN SDPA at 32K+ decode context:
+
+| Context | SM120-FA Selective | cuDNN SDPA | Speedup |
+|---|---|---|---|
+| 32K | 0.09ms | 0.17ms | 1.9x |
+| 65K | 0.10ms | 0.34ms | 3.4x |
+| 131K | 0.21ms | 0.34ms | 1.6x |
+
+Source: [csrc/sm120_flash_attn_best_ldm_bn128.cu](https://github.com/brandonmmusic-max/sm120-moe-bench) (exact kernel), [csrc/sm120_selective_v3.cu](https://github.com/brandonmmusic-max/sm120-moe-bench) (selective)
+
 ## Benchmark Results
 
 ### Optimization Journey
