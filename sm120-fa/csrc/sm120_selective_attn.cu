@@ -53,7 +53,7 @@ __global__ void selective_route(
 
     // Shared memory for Q row and block scores
     __shared__ float q_fp32[HEAD_DIM];
-    __shared__ float block_scores[1024];  // Up to 1024 blocks (64K tokens at bs=64)
+    __shared__ float block_scores[2048];  // Up to 2048 blocks (128K tokens at bs=64)
 
     // Load Q to shared memory in FP32
     if (tid < HEAD_DIM) {
@@ -92,7 +92,7 @@ __global__ void selective_route(
 
         // Mark local window blocks (most recent)
         int local_start = max(0, num_blocks - local_window);
-        bool is_local[1024];
+        bool is_local[2048];
         for (int i = 0; i < num_blocks; i++)
             is_local[i] = (i >= local_start);
 
