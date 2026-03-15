@@ -89,44 +89,78 @@ Custom Flash Attention kernel built from scratch for SM120 (RTX PRO 6000 Blackwe
 | v1.0 BM128+BN64 single-stage | 117 | 51% | 247 |
 | **v2.0 ldmatrix + register-P** | **190** | **83%** | 174 |
 | **v2.1 + BN128 + Q-preload** | **216** | **90%** | 254 |
+| **v3.0 const-mem + DS + auto-dispatch** | **237** (Sq=2K) | **105% BEATS cuDNN** | 238/251 |
 
-### Architecture
+### Architecture (v3)
 
-- **MMA:** `mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32` (SM120 uses SM80-era MMA, not wgmma)
-- **Tiles:** BM=128, BN=128, HD=128, 8 warps (256 threads)
-- **SMEM:** Q(32KB) + K(32KB) + V(32KB) = 96KB, no P buffer (register-resident)
-- **TMA:** Split-HD SWIZZLE_128B (64-elem halves, hardware swizzle)
+Two kernel variants with auto-dispatch:
+
+**BN=64 Double-Staged (Skv ≤ 2048)** — true compute/memory overlap:
+- Tiles: BM=128, BN=64, HD=128, 8 warps (256 threads)
+- SMEM: Q(32KB) + K[2 stages](32KB) + V[2 stages](32KB) = 96KB
+- True double-buffering with mbarrier phase tracking (zero `__syncthreads` in hot loop)
+- 238 registers, 80B stack
+
+**BN=128 Single-Stage (Skv > 2048)** — higher arithmetic intensity:
+- Tiles: BM=128, BN=128, HD=128, 8 warps (256 threads)
+- SMEM: Q(32KB) + K(32KB) + V(32KB) = 96KB
+- mbarrier prefetch with 1 `__syncthreads` per iteration
+- 251 registers, 0 spills
+
+**Shared optimizations (both kernels):**
+- **MMA:** `mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32`
+- **TMA:** Split-HD SWIZZLE_128B with `__constant__` memory descriptors (zero cudaMalloc per call)
 - **Loads:** `ldmatrix.x4` for Q, `ldmatrix.x2` for K, `ldmatrix.x2.trans` for V
-- **P@V:** Softmax output stays in registers — `s_acc[rh][ki*2+j][ei]` maps directly to MMA A fragment
-- **Q preload:** All 8 Q fragments (32 regs) loaded before KV loop — zero Q SMEM access in hot path
-- **Sync:** mbarrier phase tracking with prefetch, 1 `__syncthreads` per iteration (down from 3)
+- **P@V:** Register-resident P — `s_acc[rh][ki*2+j][ei]` maps directly to MMA A fragment
+- **Q preload:** All 8 Q fragments (32 regs) loaded before KV loop
+- **Output:** Vectorized uint32_t stores (halves store instruction count)
 
-### SM120 FA vs cuDNN SDPA Benchmark
+### SM120 FA v3 vs cuDNN SDPA Benchmark
 
 RTX PRO 6000 Blackwell (96GB, SM 12.0, 300W), BF16, non-causal, GQA Hq=32 Hkv=8:
 
-| Sequence Length | SM120-FA | cuDNN SDPA | Ratio |
-|---|---|---|---|
-| 1,024 | 70 TF | 200 TF | 35% |
-| 2,048 | 155 TF | 247 TF | 63% |
-| 4,096 | 196 TF | 227 TF | 86% |
-| 8,192 | 211 TF | 238 TF | 89% |
-| **16,384** | **216 TF** | **240 TF** | **90%** |
+| Sequence Length | SM120-FA v3 | cuDNN SDPA | Ratio | |
+|---|---|---|---|---|
+| 512 | **154 TF** | 100 TF | **155% BEATS** | DS |
+| 1,024 | 190 TF | 200 TF | 95% | DS |
+| **2,048** | **237 TF** | 226 TF | **105% BEATS** | DS |
+| 4,096 | 209 TF | 227 TF | 92% | SS |
+| 8,192 | 216 TF | 240 TF | 90% | SS |
+| 16,384 | 218 TF | 243 TF | 90% | SS |
 
-| Config | SM120-FA | cuDNN | Ratio |
-|---|---|---|---|
-| B=2, Sq=2048 | 176 TF | 217 TF | 81% |
-| B=4, Sq=2048 | 185 TF | 219 TF | 84% |
-| MHA (Hq=Hkv=32), Sq=4096 | 189 TF | 224 TF | 85% |
-| GQA 8:1 (Hq=64), Sq=2048 | 175 TF | 216 TF | 81% |
+| Config | SM120-FA v3 | cuDNN | Ratio | |
+|---|---|---|---|---|
+| **B=2, Sq=2048** | **223 TF** | 217 TF | **103% BEATS** | DS |
+| **B=4, Sq=2048** | **226 TF** | 221 TF | **102% BEATS** | DS |
+| MHA (Hq=Hkv=32), Sq=4096 | 204 TF | 225 TF | 91% | SS |
+| **GQA 8:1 (Hq=64), Sq=2048** | **223 TF** | 216 TF | **103% BEATS** | DS |
+
+### NCU Profiling Analysis (SS kernel, Sq=8192)
+
+| Metric | Value | Notes |
+|---|---|---|
+| Theoretical Occupancy | 16.67% | 1 block/SM (limited by regs AND SMEM) |
+| Achieved Occupancy | 16.65% | Fully achieving theoretical |
+| Registers/thread | 251 | Block limit: 1 (need ≤128 for 2 blocks) |
+| SMEM/block | 98.4 KB | Block limit: 1 (need ≤50KB for 2 blocks) |
+| Tensor pipe utilization | 65.7% | Highest-utilized pipe, well-utilized |
+| Active warps/scheduler | 2.00 | Max possible at 16.67% occupancy |
+| Eligible warps/scheduler | 0.33 | Main bottleneck — warps stall waiting for MMA |
+| Compute throughput | 65.7% | |
+| L1/TEX throughput | 34.9% | Down from 84% pre-ldmatrix |
+| DRAM throughput | 1.5% | Fully compute-bound |
+| Issue rate | 0.95 IPC | 1 instruction every 4.2 cycles |
+
+**Bottleneck:** Low occupancy (16.67%) means only 0.33 eligible warps per cycle — most time is spent stalled waiting for the tensor pipe. The remaining gap to cuDNN (~10% at long sequences) is primarily an occupancy and instruction scheduling limitation, not memory bandwidth.
 
 ### Key Discoveries
 
 - **MMA m16n8k16 fragment layout** (undocumented for SM120): A registers are interleaved row/row+8, NOT k/k+8. Ra0=[g,2t], Ra1=[g+8,2t], Ra2=[g,2t+8], Ra3=[g+8,2t+8]
 - **ldmatrix is the single biggest optimization** — 62% speedup (117→190 TF) by replacing manual `pk()` SMEM loads with `ldmatrix.x4`/`ldmatrix.x2`
 - **V needs `ldmatrix.trans`** — V's B fragment indexes rows by t (not g), requiring hardware transpose
-- **FA3-style warp specialization hurts on SM120** — losing 1/8 compute to producer warp > overlap benefit
-- **Single-stage > double-stage** — pipeline stall penalty exceeds memory overlap benefit on SM120
+- **`__constant__` TMA descriptors** — eliminating cudaMalloc/cudaFree per call gave 4.4x speedup at Sq=512 (35%→155%)
+- **Double-buffering beats single-stage at medium sequences** — BN=64 DS (237 TF at Sq=2048) > BN=128 SS (155 TF) despite lower arithmetic intensity, because overlap hides per-iteration overhead
+- **FA3-style warp specialization hurts on SM120** — CUDA allocates registers uniformly per block, so dedicated producer warps don't reduce register pressure. Losing 1/8 compute > overlap benefit
 - **Register-resident P** saves 16KB SMEM round-trip but only ~5% of total SMEM loads; ldmatrix is what matters
 
 ### Selective Attention (Decode)
@@ -139,7 +173,7 @@ Block-summary routing with mean(K_block) achieves 99.2% raw score recall. Beats 
 | 65K | 0.10ms | 0.34ms | 3.4x |
 | 131K | 0.21ms | 0.34ms | 1.6x |
 
-Source: [csrc/sm120_flash_attn_best_ldm_bn128.cu](https://github.com/brandonmmusic-max/sm120-moe-bench) (exact kernel), [csrc/sm120_selective_v3.cu](https://github.com/brandonmmusic-max/sm120-moe-bench) (selective)
+Source: [csrc/sm120_flash_attn_v3.cu](csrc/sm120_flash_attn_v3.cu) (v3 kernel), [csrc/sm120_flash_attn_best_ldm_bn128.cu](csrc/sm120_flash_attn_best_ldm_bn128.cu) (v2.1), [csrc/sm120_selective_v3.cu](csrc/sm120_selective_v3.cu) (selective)
 
 ## Benchmark Results
 
