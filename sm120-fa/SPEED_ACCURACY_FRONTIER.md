@@ -29,3 +29,23 @@ Mean block summaries achieve 99.2% routing recall. Remaining error is from trunc
 
 Error scales with log(1/coverage), not linearly. Going from 2% to 0.3% coverage
 only increases error from 0.025 to 0.061 (2.4x) while giving 3x more speed.
+
+## Amortized Decode Throughput (attention-only)
+
+| KV Length | Selective tok/s | Full Exact tok/s | Speedup |
+|-----------|----------------|-----------------|---------|
+| 8K | 4,192 | 1,896 | 2.21x |
+| 32K | 2,517 | 493 | 5.10x |
+| 131K | 888 | 124 | 7.15x |
+
+## Routing Quality Analysis
+
+| Metric | 4K | 8K | 32K | Implication |
+|--------|-----|-----|------|------------|
+| Raw score recall | 100% | 100% | 100% | Routing finds high-score blocks |
+| Softmax mass recall | 44.5% | 39.8% | 27.3% | But misses where attention concentrates |
+| Output contribution recall | 22.7% | 14.8% | 1.6% | And mostly misses what matters for output |
+
+The gap between raw score and softmax mass recall is fundamental to Q-independent
+summaries. Real (non-random) attention patterns are more structured, so practical
+quality is likely better than these random-data numbers suggest.
