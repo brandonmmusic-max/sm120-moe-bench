@@ -220,9 +220,67 @@ sm120_fa_fp8_vtrans(
         mb_wait(&mbar_kv[cs], KV_PHASE(cs));
         FLIP_KV(cs);
 
-        // ============ Q@K^T ============
-        // FP8 m16n8k32: HD/32 = 4 ki iterations
-        // BN=128: 128/8 = 16 ni tiles
+        // ============ Max-scan + two-half Q@K^T + softmax + P@V^T ============
+        // Two-phase approach to halve s_acc registers (64→32):
+        // Phase 1: Scan all 16 ni tiles to find global max (4 regs for s_tmp)
+        // Phase 2: Two BN=64 halves with correct global max → softmax + P@V^T
+        // Cost: 50% more Q@K^T MMAs but at ~168 regs vs 255.
+
+        #define BN_HALF 64
+        #define NT_HALF (BN_HALF / MMA_N)  // 8
+
+        __nv_fp8_e4m3* k_s = K_S(cs);
+        __nv_fp8_e4m3* vt_s = VT_S(cs);
+        int kvs = kv * BLOCK_N;
+
+        // ---- Phase 1: find global max across all BN=128 positions ----
+        // Process one ni tile at a time, accumulating Q@K^T across all ki.
+        // Only 4 floats needed per tile (s_tmp). Q reloaded per ni (cheap SMEM read).
+        float gmax[2] = {-FLT_MAX, -FLT_MAX};
+        #pragma unroll
+        for (int ni = 0; ni < BLOCK_N/MMA_N; ni++) {
+            float s_tmp[4] = {0,0,0,0};
+            #pragma unroll
+            for (int ki = 0; ki < HEAD_DIM/MMA_K; ki++) {
+                uint32_t qf[4];
+                int q_col = ki * MMA_K + ldm_q_col_base;
+                uint32_t q_addr = static_cast<uint32_t>(
+                    __cvta_generic_to_shared(&q_fp8[q_sw_fp8(ldm_q_row, q_col)]));
+                ldmatrix_x4(qf, q_addr);
+
+                uint32_t kf[2];
+                int kn = ni * MMA_N + ldm_k_lane_row;
+                int k_col = ki * MMA_K + ldm_k_col_off;
+                uint32_t k_addr = static_cast<uint32_t>(
+                    __cvta_generic_to_shared(&k_s[sw128(kn, k_col)]));
+                ldmatrix_x2(kf, k_addr);
+                mma_fp8(s_tmp, qf, kf);
+            }
+            // s_tmp now has full Q@K^T for this ni tile — scale, mask, track max
+            int ki0 = kvs + ni * MMA_N + t * 2;
+            s_tmp[0] *= scale; s_tmp[1] *= scale; s_tmp[2] *= scale; s_tmp[3] *= scale;
+            if (ki0 >= Skv) { s_tmp[0] = -FLT_MAX; s_tmp[2] = -FLT_MAX; }
+            if (ki0+1 >= Skv) { s_tmp[1] = -FLT_MAX; s_tmp[3] = -FLT_MAX; }
+            gmax[0] = fmaxf(gmax[0], fmaxf(s_tmp[0], s_tmp[1]));
+            gmax[1] = fmaxf(gmax[1], fmaxf(s_tmp[2], s_tmp[3]));
+        }
+        // Reduce max across threads in group
+        for (int rh = 0; rh < 2; rh++) {
+            gmax[rh] = fmaxf(gmax[rh], __shfl_xor_sync(0xffffffff, gmax[rh], 1));
+            gmax[rh] = fmaxf(gmax[rh], __shfl_xor_sync(0xffffffff, gmax[rh], 2));
+        }
+
+        // Rescale o_acc with new global max
+        for (int rh = 0; rh < 2; rh++) {
+            float rs = __expf(rmax[rh] - gmax[rh]);
+            rsum[rh] *= rs;
+            #pragma unroll
+            for (int nt = 0; nt < 16; nt++) { o_acc[rh][nt][0] *= rs; o_acc[rh][nt][1] *= rs; }
+            rmax[rh] = gmax[rh];
+        }
+
+        // ---- Phase 2: monolithic Q@K^T + softmax + P@V^T using pre-scanned gmax ----
+        // (Temporary diagnostic: full 16-tile approach with gmax from Phase 1)
         float s_acc[2][BLOCK_N/MMA_N][2];
         #pragma unroll
         for (int rh = 0; rh < 2; rh++)
@@ -230,20 +288,14 @@ sm120_fa_fp8_vtrans(
             for (int nt = 0; nt < BLOCK_N/MMA_N; nt++)
                 s_acc[rh][nt][0] = s_acc[rh][nt][1] = 0;
 
-        __nv_fp8_e4m3* k_s = K_S(cs);
-
         #pragma unroll
         for (int ki = 0; ki < HEAD_DIM/MMA_K; ki++) {
-            // Load Q fragment for this ki
             uint32_t qf[4];
             int q_col = ki * MMA_K + ldm_q_col_base;
             uint32_t q_addr = static_cast<uint32_t>(
                 __cvta_generic_to_shared(&q_fp8[q_sw_fp8(ldm_q_row, q_col)]));
             ldmatrix_x4(qf, q_addr);
-
-            // K unsplit: column = ki * MMA_K within full HEAD_DIM
             int k_col = ki * MMA_K + ldm_k_col_off;
-
             #pragma unroll
             for (int ni = 0; ni < BLOCK_N/MMA_N; ni++) {
                 uint32_t kf[2];
@@ -257,47 +309,27 @@ sm120_fa_fp8_vtrans(
             }
         }
 
-        // Scale + mask
-        int kvs = kv * BLOCK_N;
-        #pragma unroll
-        for (int rh=0;rh<2;rh++)
+        // Softmax using pre-scanned gmax (no per-block max search needed)
+        for (int rh = 0; rh < 2; rh++) {
+            float ls = 0;
             #pragma unroll
-            for (int nt=0;nt<BLOCK_N/MMA_N;nt++) {
-                s_acc[rh][nt][0]*=scale; s_acc[rh][nt][1]*=scale;
-                int ki0=kvs+nt*MMA_N+t*2;
-                if(ki0>=Skv) s_acc[rh][nt][0]=-FLT_MAX;
-                if(ki0+1>=Skv) s_acc[rh][nt][1]=-FLT_MAX;
+            for (int nt = 0; nt < BLOCK_N/MMA_N; nt++) {
+                s_acc[rh][nt][0] *= scale; s_acc[rh][nt][1] *= scale;
+                int ki0 = kvs + nt * MMA_N + t * 2;
+                if (ki0 >= Skv) s_acc[rh][nt][0] = -FLT_MAX;
+                if (ki0+1 >= Skv) s_acc[rh][nt][1] = -FLT_MAX;
+                float e0 = __expf(s_acc[rh][nt][0] - gmax[rh]);
+                float e1 = __expf(s_acc[rh][nt][1] - gmax[rh]);
+                s_acc[rh][nt][0] = e0; s_acc[rh][nt][1] = e1;
+                ls = fmaf(1.0f, e0, ls); ls = fmaf(1.0f, e1, ls);
             }
-
-        // Online softmax
-        for (int rh=0;rh<2;rh++) {
-            float tm=rmax[rh];
-            #pragma unroll
-            for (int nt=0;nt<BLOCK_N/MMA_N;nt++) { tm=fmaxf(tm,s_acc[rh][nt][0]); tm=fmaxf(tm,s_acc[rh][nt][1]); }
-            float nm=tm;
-            nm=fmaxf(nm,__shfl_xor_sync(0xffffffff,nm,1));
-            nm=fmaxf(nm,__shfl_xor_sync(0xffffffff,nm,2));
-            float rs=__expf(rmax[rh]-nm); rsum[rh]*=rs;
-            #pragma unroll
-            for (int nt=0;nt<16;nt++) { o_acc[rh][nt][0]*=rs; o_acc[rh][nt][1]*=rs; }
-            float ls=0;
-            #pragma unroll
-            for (int nt=0;nt<BLOCK_N/MMA_N;nt++) {
-                float e0=__expf(s_acc[rh][nt][0]-nm), e1=__expf(s_acc[rh][nt][1]-nm);
-                s_acc[rh][nt][0]=e0; s_acc[rh][nt][1]=e1;
-                ls=fmaf(1.0f,e0,ls); ls=fmaf(1.0f,e1,ls);
-            }
-            ls+=__shfl_xor_sync(0xffffffff,ls,1); ls+=__shfl_xor_sync(0xffffffff,ls,2);
-            rsum[rh]+=ls; rmax[rh]=nm;
+            ls += __shfl_xor_sync(0xffffffff, ls, 1);
+            ls += __shfl_xor_sync(0xffffffff, ls, 2);
+            rsum[rh] += ls;
         }
 
-        // ============ P@V^T ============
-        // Write P to SMEM for correct A fragment layout via ldmatrix.x4.
-        // Reuse K_S(cs) as P buffer (K consumed after Q@K^T). 16KB = 128×128 FP8 ✓
-        // P uses sw128 (same SWIZZLE_128B pattern, 128-byte rows).
-
-        // Write P to SMEM (reuse K buffer)
-        __nv_fp8_e4m3* p_smem = k_s;  // K_S(cs), 16KB, same 128-byte row stride
+        // P write + P@V^T (monolithic, full BN=128)
+        __nv_fp8_e4m3* p_smem = k_s;
         #pragma unroll
         for (int rh = 0; rh < 2; rh++) {
             int p_row = warp * MMA_M + g + rh * 8;
@@ -312,35 +344,31 @@ sm120_fa_fp8_vtrans(
         }
         __syncwarp();
 
-        // P@V^T: iterate over k-chunks (BN/32 = 4 ki iterations)
-        __nv_fp8_e4m3* vt_s = VT_S(cs);
         #pragma unroll
         for (int ki = 0; ki < BLOCK_N/MMA_K; ki++) {
-            // Load P fragment via ldmatrix.x4
             uint32_t pf[4];
             int p_ldm_row = warp * MMA_M + (lane & 7) + ((lane >> 3) & 1) * 8;
             int p_ldm_col = ki * MMA_K + (lane >> 4) * 16;
             uint32_t p_addr = static_cast<uint32_t>(
                 __cvta_generic_to_shared(&p_smem[sw128(p_ldm_row, p_ldm_col)]));
             ldmatrix_x4(pf, p_addr);
-
-            // Iterate over d tiles (output dimension) — VT unsplit
             int v_k_base = ki * MMA_K;
             #pragma unroll
             for (int di = 0; di < HEAD_DIM/MMA_N; di++) {
                 uint32_t vf[2];
-                int vt_r = di * MMA_N + ldm_k_lane_row;  // d position in full HEAD_DIM
+                int vt_r = di * MMA_N + ldm_k_lane_row;
                 int vt_c = v_k_base + ldm_k_col_off;
                 uint32_t v_addr = static_cast<uint32_t>(
                     __cvta_generic_to_shared(&vt_s[sw128(vt_r, vt_c)]));
                 ldmatrix_x2(vf, v_addr);
-
                 float ot[4] = {o_acc[0][di][0], o_acc[0][di][1], o_acc[1][di][0], o_acc[1][di][1]};
                 mma_fp8(ot, pf, vf);
                 o_acc[0][di][0] = ot[0]; o_acc[0][di][1] = ot[1];
                 o_acc[1][di][0] = ot[2]; o_acc[1][di][1] = ot[3];
             }
         }
+        #undef BN_HALF
+        #undef NT_HALF
 
         // Per-warp done signal
         if (lane == 0) mb_arrive(&mbar_done[cs]);
