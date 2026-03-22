@@ -68,47 +68,39 @@ Phase 2: Compute with three novel optimizations:
 ### Optimization Priority (Build Order)
 
 #### Sprint 1: Foundation (CuteDSL GEMM + SwiGLU, correct on SM120)
-- Port b12x's DenseGemmKernel to our repo (not copy — rewrite for our shapes)
-- Use sf_vec_size=16, E4M3FN scales (NVF4 format we now know is correct)
-- Validate GEMM1+SwiGLU output against PyTorch reference with random data
-- Test FC1→requant→FC2 pipeline end-to-end
+- Write CuteDSL kernel for our Qwen3.5-397B shapes (not copy b12x)
+- Use sf_vec_size=16, E4M3FN scales (NVF4 format we empirically verified)
+- Validate GEMM1+SwiGLU+requant+GEMM2 against PyTorch reference with random data
 - **Success metric**: Correct output matching reference within FP4 tolerance
 
-#### Sprint 2: SplitK for Decode (highest impact: 30-50%)
-- For M=1: split K=1024 across 8 CTAs per expert
-- 10 experts × 8 splits = 80 CTAs (vs 10 without SplitK)
+#### Sprint 2: SplitK for Decode (the differentiator)
+- For M=1: split K across 8 CTAs per expert
+- 10 experts × 8 splits = 80 CTAs (vs 10 without SplitK = 1.6% SM util)
 - Atomic reduction of partial sums, or two-pass reduce
-- **Success metric**: >180 tok/s (vs 142.6 baseline)
+- **Success metric**: Measurable decode speedup in isolated kernel benchmark
 
-#### Sprint 3: Per-Expert Ready Flags (15-25%)
-- Replace global barrier with per-expert `st/ld.global.release/acquire`
-- CTAs begin computing expert E as soon as E's data is packed
-- No waiting for experts E+1..E+9 to finish packing
-- **Success metric**: >200 tok/s
+#### Sprint 3: vLLM Integration + End-to-End Benchmark + NCU Profile
+- Wire into vLLM as SM120FusedMoEExperts
+- Benchmark real end-to-end tok/s (target: 180-200 tok/s, 25-40% over 142.6)
+- **NCU profile to identify actual bottleneck** before ANY further optimization
+- **Success metric**: >180 tok/s end-to-end, NCU data in hand
 
-#### Sprint 4: FC1→FC2 Weight Prefetch (15-25%)
-- DMA warp loads FC2 weights while MMA warps compute FC1
-- Double-buffer weight SMEM: one buffer for current GEMM, one for next
-- Start loading next expert's FC1 weights during current FC2
-- **Success metric**: >220 tok/s
+#### Sprint 4+: Data-Driven (based on NCU profiling from Sprint 3)
+- DO NOT pre-commit to specific optimizations
+- NCU will show the real bottleneck: memory bandwidth? compute? launch overhead? scatter contention?
+- Build the optimization that addresses the measured bottleneck
+- Candidate optimizations (ranked by b12x gap analysis, to be validated by NCU):
+  - Per-expert ready flags (if barrier stall is measured)
+  - FC1→FC2 weight prefetch (if weight load latency is measured)
+  - L2 cache persistence (if L2 miss rate is high)
+  - Warp-level scatter reduction (if atomic contention is measured)
+  - Asymmetric tiles (if compute utilization differs between FC1/FC2)
 
-#### Sprint 5: L2 Cache Persistence (10-20%)
-- Set `cudaAccessPolicyWindow` for active expert weights
-- 11 experts × ~2MB each = 22MB << 128MB L2
-- Pin across all 60 MoE layers for the same decode step
-- **Success metric**: >240 tok/s
-
-#### Sprint 6: Warp-Level Scatter Reduction (5-10%)
-- Buffer FC2 output per-warp before atomic scatter
-- Intra-warp shuffle reduction, then single atomic per warp
-- Reduces atomic contention from 128 threads to 4 warps
-- **Success metric**: >250 tok/s
-
-### Stretch Goals
-
-- **PDL between MoE layers**: Overlap layer N epilogue with layer N+1 prolog
-- **Cross-layer expert prediction**: Prefetch likely next-layer expert weights
-- **FlashMoE task queue**: Full producer/consumer pipeline for batch>8
+### Realistic Targets
+- **Sprint 1-2**: Correct kernel + SplitK decode = ~180 tok/s
+- **Sprint 3**: vLLM integration + profiling = 180-200 tok/s
+- **Sprint 4+**: Data-driven optimization = potential 200-250 tok/s (uncertain)
+- **Publishable result**: 25-40% improvement over FLASHINFER_CUTLASS baseline
 
 ---
 
