@@ -138,6 +138,7 @@ sm120_fused_moe_gemm1_swiglu_v3(
     const uint8_t* __restrict__ weight_fp4,    // [GATE_UP, HIDDEN/2] packed FP4
     const uint8_t* __restrict__ weight_sf,     // [GATE_UP, HIDDEN/32] UE8M0
     __nv_bfloat16* __restrict__ output,        // [M, INTERMEDIATE] BF16
+    float* __restrict__ gate_debug,            // [M, INTERMEDIATE] FP32 gate output for debug
     int M
 ) {
     const int tid = threadIdx.x;
@@ -217,24 +218,28 @@ sm120_fused_moe_gemm1_swiglu_v3(
                 }
 
                 uint16_t sfa_packed = (uint16_t)s_SFA[0] | ((uint16_t)s_SFA[1] << 8);
-                int sf_n = warp_id * MMA_N + (lane_id % 4);
-                uint16_t sfb_packed = (uint16_t)s_SFB[sf_n * 2] | ((uint16_t)s_SFB[sf_n * 2 + 1] << 8);
 
-                // MMA pass 1: A_q1 (token at row 0) → cols 0-3
+                // SFB: each thread loads the SF for its OWN output column.
+                // bid=0, tid=0: MMA uses each thread's own sfb register directly.
+                // The CLayout maps lane%4 → output col within quadrant.
+                // Q1: col = lane%4 → B-row = warp*8 + lane%4
+                // Q2: col+4 = lane%4 + 4 → B-row = warp*8 + 4 + lane%4
+                int sf_n_q1 = warp_id * MMA_N + (lane_id % 4);  // B-row for q1 cols 0-3
+                int sf_n_q2 = warp_id * MMA_N + 4 + (lane_id % 4);  // B-row for q2 cols 4-7
+                uint16_t sfb_q1 = (uint16_t)s_SFB[sf_n_q1 * 2] | ((uint16_t)s_SFB[sf_n_q1 * 2 + 1] << 8);
+                uint16_t sfb_q2 = (uint16_t)s_SFB[sf_n_q2 * 2] | ((uint16_t)s_SFB[sf_n_q2 * 2 + 1] << 8);
+
+                // MMA pass 1: A_q1 → cols 0-3
                 uint32_t a1[4];
                 ldmatrix_b4x16_x4(a1, smem_u32(&s_A1[lane_id * 16]));
                 mma_mxf4nvf4_m16n8k64(acc_q1, a1, b_regs, acc_q1,
-                    (uint32_t)sfa_packed, 0, 0, (uint32_t)sfb_packed, 0, 0);
+                    (uint32_t)sfa_packed, 0, 0, (uint32_t)sfb_q1, 0, 0);
 
-                // MMA pass 2: A_q2 (token at row 8) → cols 4-7
+                // MMA pass 2: A_q2 → cols 4-7
                 uint32_t a2[4];
                 ldmatrix_b4x16_x4(a2, smem_u32(&s_A2[lane_id * 16]));
-
-                // SFB for cols 4-7: B-rows 4-7 within this warp's tile
-                int sf_n2 = warp_id * MMA_N + 4 + (lane_id % 4);
-                uint16_t sfb2 = (uint16_t)s_SFB[sf_n2 * 2] | ((uint16_t)s_SFB[sf_n2 * 2 + 1] << 8);
                 mma_mxf4nvf4_m16n8k64(acc_q2, a2, b_regs, acc_q2,
-                    (uint32_t)sfa_packed, 0, 0, (uint32_t)sfb2, 0, 0);
+                    (uint32_t)sfa_packed, 0, 0, (uint32_t)sfb_q2, 0, 0);
             }
             __syncthreads();
         }
@@ -249,6 +254,14 @@ sm120_fused_moe_gemm1_swiglu_v3(
             int col_q2 = is_gate ? (n_off + warp_id * 8 + 4 + c) : (n_off + warp_id * 8 + 4 + c - GATE_UP / 2);
 
             if (is_gate) {
+                // DEBUG: dump raw GEMM1 gate output to separate buffer
+                if (m_group == 0 && gate_debug != nullptr) {
+                    if (col_q1 < INTERMEDIATE)
+                        gate_debug[col_q1] = acc_q1[0];
+                    if (col_q2 < INTERMEDIATE)
+                        gate_debug[col_q2] = acc_q2[0];
+                }
+                // Also store to gate buffer for SwiGLU
                 if (m_group < M && col_q1 < INTERMEDIATE)
                     s_gate[m_group * INTERMEDIATE + col_q1] = acc_q1[0];
                 if (m_group + 4 < M && col_q1 < INTERMEDIATE)
@@ -381,19 +394,13 @@ int main() {
 
     const int M = 1;
 
-    // Use small known values that are exactly representable in E2M1
-    // E2M1 values: {0, ±0.5, ±1.0, ±1.5, ±2.0, ±3.0, ±4.0, ±6.0}
-    // Use input = all 1.0, weight = all 0.5, so results are predictable
+    // Random data in [-1, 1]
+    srand(42);
     float* h_input = new float[M * HIDDEN];
     float* h_weight = new float[GATE_UP * HIDDEN];
-    for (int i = 0; i < M * HIDDEN; i++) h_input[i] = 1.0f;
-    // Gate weights: all 0.5, Up weights: all 1.0
-    for (int n = 0; n < GATE_UP / 2; n++)
-        for (int k = 0; k < HIDDEN; k++)
-            h_weight[n * HIDDEN + k] = 0.5f;  // gate
-    for (int n = GATE_UP / 2; n < GATE_UP; n++)
-        for (int k = 0; k < HIDDEN; k++)
-            h_weight[n * HIDDEN + k] = 1.0f;  // up
+    for (int i = 0; i < M * HIDDEN; i++) h_input[i] = ((float)rand() / RAND_MAX - 0.5f) * 2.0f;
+    for (int i = 0; i < GATE_UP * HIDDEN; i++) h_weight[i] = ((float)rand() / RAND_MAX - 0.5f) * 2.0f;
+    printf("Testing with random data, per-col SFB...\n");
 
     // === Run FP32 reference ===
     float *d_input_f32, *d_weight_f32, *d_ref_out;
@@ -403,12 +410,29 @@ int main() {
     cudaMemcpy(d_input_f32, h_input, M * HIDDEN * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(d_weight_f32, h_weight, GATE_UP * HIDDEN * sizeof(float), cudaMemcpyHostToDevice);
 
+    // Also compute gate-only reference: GEMM1 without SwiGLU
+    float* d_gate_ref;
+    cudaMalloc(&d_gate_ref, M * INTERMEDIATE * sizeof(float));
+    // Gate = input × gate_weights^T (first 256 rows of weight)
+    // Naive: each element = dot(input_row, weight_row)
     ref_gemm1_swiglu<<<M, INTERMEDIATE>>>(d_input_f32, d_weight_f32, d_ref_out, M);
     cudaDeviceSynchronize();
 
     float* h_ref = new float[M * INTERMEDIATE];
     cudaMemcpy(h_ref, d_ref_out, M * INTERMEDIATE * sizeof(float), cudaMemcpyDeviceToHost);
-    printf("Reference output[0:8]:  ");
+    // Compute gate-only reference: gate[col] = sum_k(input[k] * weight[col, k])
+    float* h_gate_ref = new float[INTERMEDIATE];
+    for (int col = 0; col < INTERMEDIATE; col++) {
+        float sum = 0;
+        for (int k = 0; k < HIDDEN; k++)
+            sum += h_input[k] * h_weight[col * HIDDEN + k];
+        h_gate_ref[col] = sum;
+    }
+    printf("Gate ref[0:8]:  ");
+    for (int i = 0; i < 8; i++) printf("%8.4f ", h_gate_ref[i]);
+    printf("\n");
+
+    printf("SwiGLU ref[0:8]: ");
     for (int i = 0; i < 8; i++) printf("%8.4f ", h_ref[i]);
     printf("\n");
 
@@ -449,14 +473,17 @@ int main() {
 
     // === Run fused FP4 kernel ===
     __nv_bfloat16* d_fused_out;
+    float* d_gate_debug;
     cudaMalloc(&d_fused_out, M * INTERMEDIATE * sizeof(__nv_bfloat16));
+    cudaMalloc(&d_gate_debug, M * INTERMEDIATE * sizeof(float));
     cudaMemset(d_fused_out, 0, M * INTERMEDIATE * sizeof(__nv_bfloat16));
+    cudaMemset(d_gate_debug, 0, M * INTERMEDIATE * sizeof(float));
 
     cudaFuncSetAttribute(sm120_fused_moe_gemm1_swiglu_v3,
                          cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_TOTAL);
 
     sm120_fused_moe_gemm1_swiglu_v3<<<1, BLOCK_SIZE, SMEM_TOTAL>>>(
-        d_input_fp4, d_input_sf, d_weight_fp4, d_weight_sf, d_fused_out, M);
+        d_input_fp4, d_input_sf, d_weight_fp4, d_weight_sf, d_fused_out, d_gate_debug, M);
 
     cudaError_t err = cudaDeviceSynchronize();
     if (err != cudaSuccess) {
@@ -465,7 +492,28 @@ int main() {
     }
 
     __nv_bfloat16* h_fused = new __nv_bfloat16[M * INTERMEDIATE];
+    float* h_gate_kern = new float[M * INTERMEDIATE];
     cudaMemcpy(h_fused, d_fused_out, M * INTERMEDIATE * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_gate_kern, d_gate_debug, M * INTERMEDIATE * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Compare gate outputs (FP32 ref vs FP4 kernel)
+    printf("Gate comparison (ref vs kernel FP4):\n");
+    float gate_max_err = 0, gate_sum_err = 0;
+    for (int i = 0; i < 8; i++)
+        printf("  [%d] ref=%8.2f  kern=%8.2f  ratio=%.3f\n",
+               i, h_gate_ref[i], h_gate_kern[i],
+               (h_gate_ref[i] != 0) ? h_gate_kern[i] / h_gate_ref[i] : 0);
+    for (int i = 0; i < INTERMEDIATE; i++) {
+        float err = fabsf(h_gate_ref[i] - h_gate_kern[i]);
+        gate_max_err = fmaxf(gate_max_err, err);
+        gate_sum_err += err;
+    }
+    float gate_rms = 0;
+    for (int i = 0; i < INTERMEDIATE; i++) gate_rms += h_gate_ref[i] * h_gate_ref[i];
+    gate_rms = sqrtf(gate_rms / INTERMEDIATE);
+    printf("Gate: max_err=%.2f avg_err=%.2f rms=%.2f rel=%.1f%%\n\n",
+           gate_max_err, gate_sum_err / INTERMEDIATE, gate_rms,
+           gate_rms > 0 ? 100.0f * (gate_sum_err / INTERMEDIATE) / gate_rms : 0);
 
     printf("Fused FP4 output[0:8]: ");
     for (int i = 0; i < 8; i++) printf("%8.4f ", (float)h_fused[i]);
