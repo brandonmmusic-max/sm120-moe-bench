@@ -136,8 +136,24 @@ ALayout = SM80_16x8_Row (same base!)
 ```
 But note: SM120_16x8x32_TN inherits from SM80_16x8x32_S32S8S8S32_TN, which uses
 uint8 ValTypeA. So the SMEM layout for GEMM2's A is 8-bit packed, not FP32.
-The write path: FP32 accumulator → cvt to E4M3 → pack to uint8 → write to SMEM
-in row-major order → SmemCopyAtom reads it back with the correct lane mapping.
+
+### SMEM Swizzle for GEMM2's A Operand (VERIFIED)
+
+**Plain row-major does NOT work.** CUTLASS selects `Layout_K_SW128_Atom<uint8>` for
+GEMM2's A operand (K=256, which is divisible by 128), applying `Swizzle<3,4,3>`.
+
+Swizzle formula: `addr ^ ((row & 7) << 4)` — XOR col bits[6:4] with row bits[2:0].
+This is identical to the TMA `SWIZZLE_128B` pattern from the SM120 FA kernel.
+
+```c
+// Write E4M3 intermediate to SMEM for GEMM2's A operand
+__device__ __forceinline__ int smem_sw128_e4m3(int row, int col) {
+    return row * 256 + (col ^ ((row & 7) << 4));
+}
+```
+
+Write path: FP32 accumulator → `cvt.rn.satfinite.e4m3x2.f32` → uint8 → write to
+`smem[smem_sw128_e4m3(M_row, K_col)]` → SmemCopyAtom loads with matching swizzle.
 
 ## Phases
 
