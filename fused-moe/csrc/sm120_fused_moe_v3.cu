@@ -332,9 +332,10 @@ void quantize_to_nvfp4(
         float scale = bmax / 6.0f;
         if (scale < 1e-30f) scale = 1e-30f;
 
-        // UE8M0 with bias 128: 2^(exp - 128) = scale → exp = 128 + log2(scale)
-        int exp_val = 128 + (int)roundf(log2f(scale));
-        exp_val = (exp_val < 0) ? 0 : (exp_val > 255) ? 255 : exp_val;
+        // UE8M0 with bias 128: 2^(exp - 128) = scale → exp = 128 + ceil(log2(scale))
+        // Ceil ensures scale >= max/6.0 so no E2M1 value exceeds representable range
+        int exp_val = 128 + (int)ceilf(log2f(scale));
+        exp_val = (exp_val < 1) ? 1 : (exp_val > 254) ? 254 : exp_val;
         sf_out[b] = (uint8_t)exp_val;
 
         // Actual scale from quantized exponent (bias = 128)
@@ -380,12 +381,19 @@ int main() {
 
     const int M = 1;
 
-    // Generate random test data
-    srand(42);
+    // Use small known values that are exactly representable in E2M1
+    // E2M1 values: {0, ±0.5, ±1.0, ±1.5, ±2.0, ±3.0, ±4.0, ±6.0}
+    // Use input = all 1.0, weight = all 0.5, so results are predictable
     float* h_input = new float[M * HIDDEN];
     float* h_weight = new float[GATE_UP * HIDDEN];
-    for (int i = 0; i < M * HIDDEN; i++) h_input[i] = ((float)rand() / RAND_MAX - 0.5f) * 2.0f;
-    for (int i = 0; i < GATE_UP * HIDDEN; i++) h_weight[i] = ((float)rand() / RAND_MAX - 0.5f) * 2.0f;
+    for (int i = 0; i < M * HIDDEN; i++) h_input[i] = 1.0f;
+    // Gate weights: all 0.5, Up weights: all 1.0
+    for (int n = 0; n < GATE_UP / 2; n++)
+        for (int k = 0; k < HIDDEN; k++)
+            h_weight[n * HIDDEN + k] = 0.5f;  // gate
+    for (int n = GATE_UP / 2; n < GATE_UP; n++)
+        for (int k = 0; k < HIDDEN; k++)
+            h_weight[n * HIDDEN + k] = 1.0f;  // up
 
     // === Run FP32 reference ===
     float *d_input_f32, *d_weight_f32, *d_ref_out;
