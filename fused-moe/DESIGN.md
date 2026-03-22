@@ -111,6 +111,34 @@ This conversion happens after SwiGLU, before writing the intermediate to SMEM.
 Per-block scale factors for the E4M3 intermediate are computed as:
 `scale = max(abs(block)) / 448.0` (E4M3 max = 448).
 
+### CLayout → ALayout Mapping (GEMM1 output → GEMM2 input)
+
+**Critical layout mismatch to handle:**
+
+GEMM1 accumulators sit in registers per CLayout (`SM80_16x8_Row`): each thread
+owns specific (M, N_intermediate) positions. When writing to SMEM for GEMM2's A
+operand, the data must land in GEMM2's **ALayout** — NOT CLayout.
+
+- CLayout tells you: which thread owns which (M, N_gemm1) accumulator element
+- GEMM2's ALayout tells you: how (thread, value) maps to (M, K_gemm2) for A operand
+
+Since GEMM2's A dimension = GEMM1's output N dimension (both = intermediate),
+the M-indexing is consistent (same token dimension), but the K-packing differs:
+GEMM2 A has K=256 (intermediate dim) tiled at K=32 per MMA.
+
+**Solution:** Write a helper function that maps each thread's CLayout accumulator
+registers to the correct SMEM positions for GEMM2's SmemCopyAtom to load as A
+fragments. This is a one-time layout exercise validated against reference output.
+
+GEMM2 ALayout (from SM80_16x8x32 traits):
+```
+ALayout = SM80_16x8_Row (same base!)
+```
+But note: SM120_16x8x32_TN inherits from SM80_16x8x32_S32S8S8S32_TN, which uses
+uint8 ValTypeA. So the SMEM layout for GEMM2's A is 8-bit packed, not FP32.
+The write path: FP32 accumulator → cvt to E4M3 → pack to uint8 → write to SMEM
+in row-major order → SmemCopyAtom reads it back with the correct lane mapping.
+
 ## Phases
 
 1. **Baseline** ✅ — 52μs/layer measured
