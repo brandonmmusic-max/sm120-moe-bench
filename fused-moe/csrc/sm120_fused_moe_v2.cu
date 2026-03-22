@@ -28,7 +28,6 @@
 
 #include <cutlass/cutlass.h>
 #include <cutlass/numeric_types.h>
-#include <cutlass/arch/mma_sm120.hpp>
 
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
@@ -489,25 +488,88 @@ int main() {
     printf("Warps per N-tile: %d, total MMA tiles per pass: %d\n\n",
            BN / 8, BN / 8);
 
-    // Launch fused kernel (with dummy FP4 data for now — correctness TBD)
-    printf("Launching fused kernel (compilation test)...\n");
+    // Quantize test data to FP4 for fused kernel
+    printf("Quantizing test data to FP4...\n");
+
+    // Simple FP4 quantization: scale to [-6, 6] range, round to nearest E2M1
+    // For Phase 1c: use simple uniform quantization (proper NVFP4 in Phase 2)
+    uint8_t* h_input_fp4 = new uint8_t[M * HIDDEN / 2];
+    uint8_t* h_input_sf = new uint8_t[(M + 31) / 32 * (HIDDEN / 32)];
+    uint8_t* h_weight_fp4 = new uint8_t[GATE_UP * HIDDEN / 2];
+    uint8_t* h_weight_sf = new uint8_t[GATE_UP * (HIDDEN / 32)];
+
+    // Scale factors: use exponent 0x3F = 2^(63-127) = 2^(-64) ≈ 5.42e-20
+    // Actually for small test values (~0.01), we want scale ≈ 0.01/6 ≈ 0.0017
+    // UE8M0 exponent: 2^(e-127) = 0.0017 → e = 127 + log2(0.0017) ≈ 127 - 9.2 ≈ 118
+    // For simplicity, set SF = 1.0 (exponent 127 = 0x7F) and scale input to FP4 range
+
+    // Zero-fill for safety
+    memset(h_input_fp4, 0, M * HIDDEN / 2);
+    memset(h_weight_fp4, 0, GATE_UP * HIDDEN / 2);
+    memset(h_input_sf, 0x7F, (M + 31) / 32 * (HIDDEN / 32));  // SF = 1.0
+    memset(h_weight_sf, 0x7F, GATE_UP * (HIDDEN / 32));         // SF = 1.0
+
+    // Quantize input: each FP4 nibble encodes index into {0,0.5,1,1.5,2,3,4,6}
+    // For small values, most will map to 0 or 0.5
+    // Pack 2 FP4 values per byte: byte = (hi_nibble << 4) | lo_nibble
+    for (int i = 0; i < M * HIDDEN; i += 2) {
+        float v0 = h_input[i] * 100.0f;   // scale up to FP4 range
+        float v1 = h_input[i+1] * 100.0f;
+        // Simple clamp to 3-bit unsigned + sign
+        int q0 = (int)(fabs(v0) + 0.5f); q0 = q0 > 7 ? 7 : q0;
+        if (v0 < 0) q0 |= 8;  // sign bit
+        int q1 = (int)(fabs(v1) + 0.5f); q1 = q1 > 7 ? 7 : q1;
+        if (v1 < 0) q1 |= 8;
+        h_input_fp4[i/2] = (uint8_t)((q1 << 4) | (q0 & 0xF));
+    }
+
+    // Quantize weights similarly
+    for (int i = 0; i < GATE_UP * HIDDEN; i += 2) {
+        float v0 = h_weight[i] * 100.0f;
+        float v1 = h_weight[i+1] * 100.0f;
+        int q0 = (int)(fabs(v0) + 0.5f); q0 = q0 > 7 ? 7 : q0;
+        if (v0 < 0) q0 |= 8;
+        int q1 = (int)(fabs(v1) + 0.5f); q1 = q1 > 7 ? 7 : q1;
+        if (v1 < 0) q1 |= 8;
+        h_weight_fp4[i/2] = (uint8_t)((q1 << 4) | (q0 & 0xF));
+    }
+
+    uint8_t *d_input_fp4, *d_input_sf_dev, *d_weight_fp4, *d_weight_sf;
+    cudaMalloc(&d_input_fp4, M * HIDDEN / 2);
+    cudaMalloc(&d_input_sf_dev, (M + 31) / 32 * (HIDDEN / 32));
+    cudaMalloc(&d_weight_fp4, GATE_UP * HIDDEN / 2);
+    cudaMalloc(&d_weight_sf, GATE_UP * (HIDDEN / 32));
+
+    cudaMemcpy(d_input_fp4, h_input_fp4, M * HIDDEN / 2, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_input_sf_dev, h_input_sf, (M + 31) / 32 * (HIDDEN / 32), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_weight_fp4, h_weight_fp4, GATE_UP * HIDDEN / 2, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_weight_sf, h_weight_sf, GATE_UP * (HIDDEN / 32), cudaMemcpyHostToDevice);
+
     __nv_bfloat16* d_output_fused;
     cudaMalloc(&d_output_fused, M * INTERMEDIATE * sizeof(__nv_bfloat16));
 
+    printf("Launching fused kernel with FP4 data...\n");
     cudaFuncSetAttribute(sm120_fused_moe_gemm1_swiglu_v2,
                          cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_TOTAL);
 
-    // Note: passing nullptr for FP4 inputs — this is a compile+launch test only.
-    // Correctness testing requires proper FP4 quantization of the test data.
     sm120_fused_moe_gemm1_swiglu_v2<<<1, BLOCK_SIZE, SMEM_TOTAL>>>(
-        nullptr, nullptr, nullptr, nullptr, d_output_fused, M);
+        d_input_fp4, d_input_sf_dev, d_weight_fp4, d_weight_sf, d_output_fused, M);
 
     cudaError_t err = cudaDeviceSynchronize();
     if (err != cudaSuccess) {
         printf("Launch error: %s\n", cudaGetErrorString(err));
     } else {
-        printf("Fused kernel launched successfully (null-input test).\n");
+        // Read back output
+        __nv_bfloat16* h_fused = new __nv_bfloat16[M * INTERMEDIATE];
+        cudaMemcpy(h_fused, d_output_fused, M * INTERMEDIATE * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost);
+        printf("Fused output[0:8]: ");
+        for (int i = 0; i < 8; i++) printf("%.6f ", (float)h_fused[i]);
+        printf("\n");
+        printf("Fused kernel launched successfully!\n");
+        delete[] h_fused;
     }
+
+    delete[] h_input_fp4; delete[] h_input_sf; delete[] h_weight_fp4; delete[] h_weight_sf;
 
     // Cleanup
     delete[] h_input; delete[] h_weight; delete[] h_ref;
