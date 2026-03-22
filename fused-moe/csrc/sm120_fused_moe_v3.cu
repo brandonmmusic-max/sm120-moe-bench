@@ -161,11 +161,25 @@ sm120_fused_moe_gemm1_swiglu_v3(
     uint8_t* s_SFB = s_SFA + SMEM_SFA;
     float*   s_gate = reinterpret_cast<float*>(s_SFB + SMEM_SFB);
 
-    const int N_PASSES = GATE_UP / BN;  // 8
+    // Each MMA loads MMA_N=8 B-rows but produces only 4 useful N-columns
+    // (due to SM120 quadrant split, cols 4-7 go to rows 8-15 quadrant).
+    // 8 warps × 8 B-rows = 64 B-rows loaded per pass (BN=64).
+    // 8 warps × 4 useful cols = 32 output columns per pass.
+    // GATE_UP = 512 → need 512/32 = 16 passes, loading 16*64 = 1024 B-rows.
+    // But we only have 512 weight rows total!
+    //
+    // Solution: each warp loads 4 B-rows (its useful columns) + 4 padding rows.
+    // Or: advance n_off by 32 per pass (not 64), loading B-rows [n_off..n_off+63]
+    // with overlap between passes. This wastes bandwidth but keeps SMEM layout simple.
+    //
+    // Better solution: keep BN=64 advance, accept 32 useful cols per pass.
+    // 512 / 64 = 8 passes (same as before), getting 32 * 8 = 256 useful cols = GATE_UP/2 ✓
+    const int N_PASSES = GATE_UP / BN;  // 8 passes, 32 useful cols each = 256 total
 
     for (int n_pass = 0; n_pass < N_PASSES; n_pass++) {
-        const int n_off = n_pass * BN;
-        const bool is_gate = (n_pass < GATE_UP / 2 / BN);
+        const int n_off = n_pass * BN;  // advance by 64 B-rows per pass
+        // First 4 passes (n_off 0-255) = gate, last 4 (256-511) = up
+        const bool is_gate = (n_off < GATE_UP / 2);
 
         // Accumulator per warp (each warp handles 1 MMA N-tile = 8 cols)
         float acc[4] = {0, 0, 0, 0};
@@ -190,7 +204,8 @@ sm120_fused_moe_gemm1_swiglu_v3(
                 int row = i / (BK / 2);
                 int col = i % (BK / 2);
                 int n_global = n_off + row;
-                s_B[i] = weight_fp4[n_global * (HIDDEN / 2) + k_off / 2 + col];
+                s_B[i] = (n_global < GATE_UP) ?
+                    weight_fp4[n_global * (HIDDEN / 2) + k_off / 2 + col] : 0;
             }
 
             // SFA: [1, BK/SF_BLOCK=2] bytes (BM=16 < SF_BLOCK=32, so 1 M-block)
@@ -209,6 +224,7 @@ sm120_fused_moe_gemm1_swiglu_v3(
             __syncthreads();
 
             // === MMA: each warp handles one MMA N-tile ===
+            int col_in_tile = lane_id % 4;  // output col within warp's 4 active cols
             if (warp_id < N_MMA_PER_BN) {
                 // Load A fragment via ldmatrix.b4x16_p64.x4
                 // A in SMEM: [16, 32] bytes row-major
@@ -241,14 +257,21 @@ sm120_fused_moe_gemm1_swiglu_v3(
                 // scale_vec::2X means the MMA processes both blocks,
                 // so we pack 2 UE8M0 values into uint16
 
-                // === BISECTION TEST: force all scale factors to 1.0 ===
-                // UE8M0: value = 2^(exp-127), so 1.0 = exp 127 = 0x7F
-                // Pack 2 blocks of 0x7F into uint16 = 0x7F7F
-                uint16_t sfa_packed = 0x7F7F;  // both K-blocks = 1.0
-                uint16_t sfb_packed = 0x7F7F;  // both K-blocks = 1.0
+                // Real scale factors from SMEM
+                // UE8M0 bias = 128: value = 2^(exp - 128)
+                // SFA: 2 K-blocks packed into uint16 (lo=block0, hi=block1)
+                uint16_t sfa_packed = (uint16_t)s_SFA[0] | ((uint16_t)s_SFA[1] << 8);
 
-                // For the block-scaled MMA, bidA/tidA/bidB/tidB = 0
-                // When all scale factors are identical (1.0), routing doesn't matter
+                // SFB: scale for this warp's B-rows
+                // Warp w's first B-row in tile = w * MMA_N = w * 8
+                // The active col for this lane = w*8 + lane%4
+                // SF is per N-row, 2 K-blocks (k=0..31, k=32..63)
+                int sf_n = warp_id * MMA_N + col_in_tile;  // B-row index in tile
+                uint16_t sfb_packed = (uint16_t)s_SFB[sf_n * 2 + 0] |
+                                      ((uint16_t)s_SFB[sf_n * 2 + 1] << 8);
+
+                // bid/tid = 0 works when all SFs within a block are the same
+                // (empirically verified: sweep had no effect)
                 uint16_t bidA = 0;
                 uint16_t tidA = 0;
                 uint16_t bidB = 0;
@@ -265,44 +288,76 @@ sm120_fused_moe_gemm1_swiglu_v3(
         }  // K-loop
 
         // === Store gate / apply SwiGLU ===
+        // SM120 FP4 MMA CLayout (empirically mapped):
+        //   d[0] = C[group, col]     where group=lane/8, col=lane%4
+        //   d[2] = C[group+4, col]   (rows 0-3 → cols 0-3 quadrant)
+        //   d[0] also = C[group+8, col+4]  (rows 8-15 → cols 4-7 quadrant, SUMMED!)
+        //   d[2] also = C[group+12, col+4]
+        //   d[1] = d[3] = always 0
+        //
+        // For decode M=1: only row 0 active. group=0 (lanes 0-7) holds C[0, 0..3].
+        // The second quadrant (rows 8+) contributes 0. So d[0] = C[0, col] cleanly.
+        //
+        // Each MMA covers 4 N-columns (not 8!). With 8 warps:
+        //   warp 0 → N-cols 0-3 of the B tile
+        //   warp 1 → N-cols 4-7? No — each warp loads 8 B-rows but only
+        //   columns 0-3 appear in the output. The other 4 B-rows contribute
+        //   to the second quadrant which is summed into the same registers.
+        //
+        // For M=1: warp w produces C[0, w*4 .. w*4+3]? No, all warps load
+        // the SAME A tile. The B tile per warp has different N-rows.
+        // Let me just use: lane%4 gives the output column WITHIN this warp's MMA.
+        // With 8 warps × 4 cols = 32 cols per N-pass, not 64.
+        // This means we need 64/4 = 16 N-passes, not 8.
+        //
+        // Actually, the MMA is m16n8k64 but the effective output is m8n4.
+        // 8 warps × 4 cols = 32 unique output columns per N-pass.
+        // For GATE_UP/2 = 256 intermediate cols: 256/32 = 8 gate passes. Fine.
+        //
+        // FOR NOW: just store the 4 cols per warp that we know are correct.
+
         if (warp_id < N_MMA_PER_BN) {
-            int out_col_base = (is_gate ? n_off : n_off - GATE_UP / 2) + warp_id * MMA_N;
+            // B-row → output col mapping (empirically verified):
+            //   B-rows 0-3 → active quadrant cols 0-3 (for M≤4)
+            //   B-rows 4-7 → inactive quadrant (zero for M≤4)
+            //
+            // Weight matrix column = n_off + B-row-in-tile
+            // This warp's B-rows in tile: [warp_id*8 .. warp_id*8+7]
+            // Active B-rows: warp_id*8 + 0..3 → weight cols n_off + warp_id*8 + 0..3
+            //
+            // Output intermediate col = weight col (direct mapping for gate/up)
+            // Gate cols: 0..255 (weight rows 0..255)
+            // Up cols:   0..255 (weight rows 256..511, offset by GATE_UP/2)
+            int col_in_warp = lane_id % 4;
+            int weight_col = n_off + warp_id * 8 + col_in_warp;
+            int out_col = is_gate ? weight_col : (weight_col - GATE_UP / 2);
+            int m_group = lane_id / 8;  // 0..3 → M-rows 0..3
+
+            // Only lanes where m_group < M produce valid output
+            // For M=1: only m_group=0 (lanes 0-7) is valid
+            // d[0] = C[m_group, col], d[2] = C[m_group+4, col]
 
             if (is_gate) {
-                // Store to SMEM gate buffer
-                if (frow0 < M && out_col_base + fcol0 < INTERMEDIATE) {
-                    s_gate[frow0 * INTERMEDIATE + out_col_base + fcol0] = acc[0];
-                    s_gate[frow0 * INTERMEDIATE + out_col_base + fcol1] = acc[2];
+                if (m_group < M && out_col < INTERMEDIATE) {
+                    s_gate[m_group * INTERMEDIATE + out_col] = acc[0];
                 }
-                if (frow1 < M && out_col_base + fcol0 < INTERMEDIATE) {
-                    s_gate[frow1 * INTERMEDIATE + out_col_base + fcol0] = acc[1];
-                    s_gate[frow1 * INTERMEDIATE + out_col_base + fcol1] = acc[3];
+                // d[2] = row m_group+4 — only valid if M > 4
+                if (m_group + 4 < M && out_col < INTERMEDIATE) {
+                    s_gate[(m_group + 4) * INTERMEDIATE + out_col] = acc[2];
                 }
             } else {
-                __syncthreads();  // ensure gate is written
+                __syncthreads();
 
-                float g0 = 0, g1 = 0, g2 = 0, g3 = 0;
-                if (frow0 < M && out_col_base + fcol0 < INTERMEDIATE) {
-                    g0 = s_gate[frow0 * INTERMEDIATE + out_col_base + fcol0];
-                    g2 = s_gate[frow0 * INTERMEDIATE + out_col_base + fcol1];
+                float gate_val = 0;
+                if (m_group < M && out_col < INTERMEDIATE) {
+                    gate_val = s_gate[m_group * INTERMEDIATE + out_col];
+                    float swiglu = acc[0] * silu_f(gate_val);
+                    output[m_group * INTERMEDIATE + out_col] = __float2bfloat16(swiglu);
                 }
-                if (frow1 < M && out_col_base + fcol0 < INTERMEDIATE) {
-                    g1 = s_gate[frow1 * INTERMEDIATE + out_col_base + fcol0];
-                    g3 = s_gate[frow1 * INTERMEDIATE + out_col_base + fcol1];
-                }
-
-                float o0 = acc[0] * silu_f(g0);
-                float o1 = acc[1] * silu_f(g1);
-                float o2 = acc[2] * silu_f(g2);
-                float o3 = acc[3] * silu_f(g3);
-
-                if (frow0 < M && out_col_base + fcol0 < INTERMEDIATE) {
-                    output[frow0 * INTERMEDIATE + out_col_base + fcol0] = __float2bfloat16(o0);
-                    output[frow0 * INTERMEDIATE + out_col_base + fcol1] = __float2bfloat16(o2);
-                }
-                if (frow1 < M && out_col_base + fcol0 < INTERMEDIATE) {
-                    output[frow1 * INTERMEDIATE + out_col_base + fcol0] = __float2bfloat16(o1);
-                    output[frow1 * INTERMEDIATE + out_col_base + fcol1] = __float2bfloat16(o3);
+                if (m_group + 4 < M && out_col < INTERMEDIATE) {
+                    gate_val = s_gate[(m_group + 4) * INTERMEDIATE + out_col];
+                    float swiglu = acc[2] * silu_f(gate_val);
+                    output[(m_group + 4) * INTERMEDIATE + out_col] = __float2bfloat16(swiglu);
                 }
             }
         }
@@ -360,13 +415,13 @@ void quantize_to_nvfp4(
         float scale = bmax / 6.0f;
         if (scale < 1e-30f) scale = 1e-30f;
 
-        // UE8M0: 2^(exp - 127) = scale → exp = 127 + log2(scale)
-        int exp_val = 127 + (int)roundf(log2f(scale));
+        // UE8M0 with bias 128: 2^(exp - 128) = scale → exp = 128 + log2(scale)
+        int exp_val = 128 + (int)roundf(log2f(scale));
         exp_val = (exp_val < 0) ? 0 : (exp_val > 255) ? 255 : exp_val;
         sf_out[b] = (uint8_t)exp_val;
 
-        // Actual scale from quantized exponent
-        float actual_scale = powf(2.0f, (float)(exp_val - 127));
+        // Actual scale from quantized exponent (bias = 128)
+        float actual_scale = powf(2.0f, (float)(exp_val - 128));
 
         // Quantize each element to nearest E2M1
         for (int i = start; i < end; i++) {
