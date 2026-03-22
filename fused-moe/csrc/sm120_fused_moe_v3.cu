@@ -62,8 +62,8 @@ static constexpr int SMEM_SFA = 64;                     // small
 static constexpr int SMEM_SFB = BN * (BK / SF_BLOCK);  // 64*2 = 128
 static constexpr int SMEM_GATE = BM * INTERMEDIATE * sizeof(float);  // 16384
 
-// Single-buffered for simplicity in Phase 1c (double-buffer in Phase 2)
-static constexpr int SMEM_TOTAL = SMEM_A + SMEM_B + SMEM_SFA + SMEM_SFB + SMEM_GATE + 256;
+// Two A tiles (q1 + q2) + B + SF + gate buffer
+static constexpr int SMEM_TOTAL = 2 * SMEM_A + SMEM_B + SMEM_SFA + SMEM_SFB + SMEM_GATE + 256;
 
 // ============================================================================
 // Inline PTX helpers
@@ -155,214 +155,131 @@ sm120_fused_moe_gemm1_swiglu_v3(
     const int fcol0 = 2 * t, fcol1 = 2 * t + 1;
 
     extern __shared__ char smem[];
-    uint8_t* s_A   = reinterpret_cast<uint8_t*>(smem);
-    uint8_t* s_B   = s_A + SMEM_A;
-    uint8_t* s_SFA = s_B + SMEM_B;
-    uint8_t* s_SFB = s_SFA + SMEM_SFA;
-    float*   s_gate = reinterpret_cast<float*>(s_SFB + SMEM_SFB);
+    // Two A tiles: A_q1 (token at row 0) and A_q2 (token at row 8)
+    uint8_t* s_A1  = reinterpret_cast<uint8_t*>(smem);               // 512 bytes
+    uint8_t* s_A2  = s_A1 + SMEM_A;                                   // 512 bytes
+    uint8_t* s_B   = s_A2 + SMEM_A;                                   // 2048 bytes
+    uint8_t* s_SFA = s_B + SMEM_B;                                    // 64 bytes
+    uint8_t* s_SFB = s_SFA + SMEM_SFA;                                // 128 bytes
+    float*   s_gate = reinterpret_cast<float*>(s_SFB + SMEM_SFB);     // 16384 bytes
 
-    // Each MMA loads MMA_N=8 B-rows but produces only 4 useful N-columns
-    // (due to SM120 quadrant split, cols 4-7 go to rows 8-15 quadrant).
-    // 8 warps × 8 B-rows = 64 B-rows loaded per pass (BN=64).
-    // 8 warps × 4 useful cols = 32 output columns per pass.
-    // GATE_UP = 512 → need 512/32 = 16 passes, loading 16*64 = 1024 B-rows.
-    // But we only have 512 weight rows total!
-    //
-    // Solution: each warp loads 4 B-rows (its useful columns) + 4 padding rows.
-    // Or: advance n_off by 32 per pass (not 64), loading B-rows [n_off..n_off+63]
-    // with overlap between passes. This wastes bandwidth but keeps SMEM layout simple.
-    //
-    // Better solution: keep BN=64 advance, accept 32 useful cols per pass.
-    // 512 / 64 = 8 passes (same as before), getting 32 * 8 = 256 useful cols = GATE_UP/2 ✓
-    const int N_PASSES = GATE_UP / BN;  // 8 passes, 32 useful cols each = 256 total
+    // 8 N-passes: 4 gate (weight rows 0-255) + 4 up (weight rows 256-511)
+    // Each pass: BN=64 B-rows, 8 warps × 8 MMA cols = 64 output cols
+    // Using dual-quadrant MMA (2 MMAs per K-iter) to get all 8 cols per warp
+    const int N_PASSES = GATE_UP / BN;  // 8
 
     for (int n_pass = 0; n_pass < N_PASSES; n_pass++) {
-        const int n_off = n_pass * BN;  // advance by 64 B-rows per pass
-        // First 4 passes (n_off 0-255) = gate, last 4 (256-511) = up
+        const int n_off = n_pass * BN;
         const bool is_gate = (n_off < GATE_UP / 2);
 
-        // Accumulator per warp (each warp handles 1 MMA N-tile = 8 cols)
-        float acc[4] = {0, 0, 0, 0};
+        // Two accumulators: q1 for B-rows 0-3 (cols 0-3), q2 for B-rows 4-7 (cols 4-7)
+        float acc_q1[4] = {0, 0, 0, 0};
+        float acc_q2[4] = {0, 0, 0, 0};
 
-        // K-loop: HIDDEN/BK = 64 iterations
         for (int ki = 0; ki < HIDDEN / BK; ki++) {
             const int k_off = ki * BK;
 
-            // === Cooperative SMEM loads ===
-
-            // A tile: [BM=16 rows, BK/2=32 cols] bytes = 512 bytes
-            // Layout: row-major, row i at bytes [i*32, i*32+31]
+            // Load A_q1: token at row 0 (rows 1-15 zero)
             for (int i = tid; i < SMEM_A; i += BLOCK_SIZE) {
-                int row = i / (BK / 2);
-                int col = i % (BK / 2);
-                s_A[i] = (row < M) ? input_fp4[row * (HIDDEN / 2) + k_off / 2 + col] : 0;
+                int row = i / (BK / 2), col = i % (BK / 2);
+                s_A1[i] = (row < M) ? input_fp4[row * (HIDDEN / 2) + k_off / 2 + col] : 0;
             }
-
-            // B tile: [BN=64 rows, BK/2=32 cols] bytes = 2048 bytes
-            // Weight layout: [N_total, K_total/2] row-major packed FP4
+            // Load A_q2: token at row 8 (rows 0-7 zero, row 8 = token data)
+            for (int i = tid; i < SMEM_A; i += BLOCK_SIZE) {
+                int row = i / (BK / 2), col = i % (BK / 2);
+                int src_row = row - 8;  // row 8 maps to token 0
+                s_A2[i] = (src_row >= 0 && src_row < M) ?
+                    input_fp4[src_row * (HIDDEN / 2) + k_off / 2 + col] : 0;
+            }
+            // Load B: [64 rows, 32 bytes/row]
             for (int i = tid; i < SMEM_B; i += BLOCK_SIZE) {
-                int row = i / (BK / 2);
-                int col = i % (BK / 2);
-                int n_global = n_off + row;
-                s_B[i] = (n_global < GATE_UP) ?
-                    weight_fp4[n_global * (HIDDEN / 2) + k_off / 2 + col] : 0;
+                int row = i / (BK / 2), col = i % (BK / 2);
+                s_B[i] = weight_fp4[(n_off + row) * (HIDDEN / 2) + k_off / 2 + col];
             }
-
-            // SFA: [1, BK/SF_BLOCK=2] bytes (BM=16 < SF_BLOCK=32, so 1 M-block)
-            if (tid < BK / SF_BLOCK) {
-                s_SFA[tid] = input_sf[0 * (HIDDEN / SF_BLOCK) + k_off / SF_BLOCK + tid];
-            }
-
-            // SFB: [BN=64, BK/SF_BLOCK=2] = 128 bytes
+            // SFA
+            if (tid < BK / SF_BLOCK)
+                s_SFA[tid] = input_sf[k_off / SF_BLOCK + tid];
+            // SFB
             for (int i = tid; i < BN * (BK / SF_BLOCK); i += BLOCK_SIZE) {
-                int sf_n = i / (BK / SF_BLOCK);
-                int sf_k = i % (BK / SF_BLOCK);
-                int n_global = n_off + sf_n;
-                s_SFB[i] = weight_sf[n_global * (HIDDEN / SF_BLOCK) + k_off / SF_BLOCK + sf_k];
+                int sf_n = i / (BK / SF_BLOCK), sf_k = i % (BK / SF_BLOCK);
+                s_SFB[i] = weight_sf[(n_off + sf_n) * (HIDDEN / SF_BLOCK) + k_off / SF_BLOCK + sf_k];
             }
 
             __syncthreads();
 
-            // === MMA: each warp handles one MMA N-tile ===
-            int col_in_tile = lane_id % 4;  // output col within warp's 4 active cols
             if (warp_id < N_MMA_PER_BN) {
-                // Load A fragment via ldmatrix.b4x16_p64.x4
-                // A in SMEM: [16, 32] bytes row-major
-                // ldmatrix: thread t loads 16 bytes starting at t * 16
-                // For 16 rows × 32 bytes/row = 512 bytes = 32 threads × 16 bytes
-                uint32_t a_regs[4];
-                {
-                    uint32_t addr = smem_u32(&s_A[lane_id * 16]);
-                    ldmatrix_b4x16_x4(a_regs, addr);
-                }
-
-                // Load B fragment via ldmatrix.b4x16_p64.x2
-                // B for this warp's N-tile: [MMA_N=8 rows, BK=64 cols] FP4
-                // = [8, 32] bytes = 256 bytes
-                // x2 ldmatrix: 32 threads each provide a 16-byte-aligned addr,
-                // but only 16 threads' data is used (256 / 16 = 16).
-                // Lanes 16-31 must still provide VALID aligned addresses.
+                // Load B fragment (same for both quadrant passes)
                 uint32_t b_regs[2];
                 {
-                    int b_base = warp_id * MMA_N * (BK / 2);  // start of this warp's 8 rows
-                    // lane_id 0-15 cover the 256 bytes (16 * 16 = 256)
-                    // lane_id 16-31 wrap around to provide valid addresses
-                    int b_lane = lane_id % 16;
-                    uint32_t addr = smem_u32(&s_B[b_base + b_lane * 16]);
+                    int b_base = warp_id * MMA_N * (BK / 2);
+                    uint32_t addr = smem_u32(&s_B[b_base + (lane_id % 16) * 16]);
                     ldmatrix_b4x16_x2(b_regs, addr);
                 }
 
-                // Scale factors for this K-tile
-                // For K=64 with SF_BLOCK=32: 2 scale blocks (k=0..31, k=32..63)
-                // scale_vec::2X means the MMA processes both blocks,
-                // so we pack 2 UE8M0 values into uint16
-
-                // Real scale factors from SMEM
-                // UE8M0 bias = 128: value = 2^(exp - 128)
-                // SFA: 2 K-blocks packed into uint16 (lo=block0, hi=block1)
                 uint16_t sfa_packed = (uint16_t)s_SFA[0] | ((uint16_t)s_SFA[1] << 8);
+                int sf_n = warp_id * MMA_N + (lane_id % 4);
+                uint16_t sfb_packed = (uint16_t)s_SFB[sf_n * 2] | ((uint16_t)s_SFB[sf_n * 2 + 1] << 8);
 
-                // SFB: scale for this warp's B-rows
-                // Warp w's first B-row in tile = w * MMA_N = w * 8
-                // The active col for this lane = w*8 + lane%4
-                // SF is per N-row, 2 K-blocks (k=0..31, k=32..63)
-                int sf_n = warp_id * MMA_N + col_in_tile;  // B-row index in tile
-                uint16_t sfb_packed = (uint16_t)s_SFB[sf_n * 2 + 0] |
-                                      ((uint16_t)s_SFB[sf_n * 2 + 1] << 8);
+                // MMA pass 1: A_q1 (token at row 0) → cols 0-3
+                uint32_t a1[4];
+                ldmatrix_b4x16_x4(a1, smem_u32(&s_A1[lane_id * 16]));
+                mma_mxf4nvf4_m16n8k64(acc_q1, a1, b_regs, acc_q1,
+                    (uint32_t)sfa_packed, 0, 0, (uint32_t)sfb_packed, 0, 0);
 
-                // bid/tid = 0 works when all SFs within a block are the same
-                // (empirically verified: sweep had no effect)
-                uint16_t bidA = 0;
-                uint16_t tidA = 0;
-                uint16_t bidB = 0;
-                uint16_t tidB = 0;
+                // MMA pass 2: A_q2 (token at row 8) → cols 4-7
+                uint32_t a2[4];
+                ldmatrix_b4x16_x4(a2, smem_u32(&s_A2[lane_id * 16]));
 
-                mma_mxf4nvf4_m16n8k64(
-                    acc, a_regs, b_regs, acc,
-                    (uint32_t)sfa_packed, bidA, tidA,
-                    (uint32_t)sfb_packed, bidB, tidB
-                );
+                // SFB for cols 4-7: B-rows 4-7 within this warp's tile
+                int sf_n2 = warp_id * MMA_N + 4 + (lane_id % 4);
+                uint16_t sfb2 = (uint16_t)s_SFB[sf_n2 * 2] | ((uint16_t)s_SFB[sf_n2 * 2 + 1] << 8);
+                mma_mxf4nvf4_m16n8k64(acc_q2, a2, b_regs, acc_q2,
+                    (uint32_t)sfa_packed, 0, 0, (uint32_t)sfb2, 0, 0);
             }
-
             __syncthreads();
-        }  // K-loop
+        }
 
-        // === Store gate / apply SwiGLU ===
-        // SM120 FP4 MMA CLayout (empirically mapped):
-        //   d[0] = C[group, col]     where group=lane/8, col=lane%4
-        //   d[2] = C[group+4, col]   (rows 0-3 → cols 0-3 quadrant)
-        //   d[0] also = C[group+8, col+4]  (rows 8-15 → cols 4-7 quadrant, SUMMED!)
-        //   d[2] also = C[group+12, col+4]
-        //   d[1] = d[3] = always 0
-        //
-        // For decode M=1: only row 0 active. group=0 (lanes 0-7) holds C[0, 0..3].
-        // The second quadrant (rows 8+) contributes 0. So d[0] = C[0, col] cleanly.
-        //
-        // Each MMA covers 4 N-columns (not 8!). With 8 warps:
-        //   warp 0 → N-cols 0-3 of the B tile
-        //   warp 1 → N-cols 4-7? No — each warp loads 8 B-rows but only
-        //   columns 0-3 appear in the output. The other 4 B-rows contribute
-        //   to the second quadrant which is summed into the same registers.
-        //
-        // For M=1: warp w produces C[0, w*4 .. w*4+3]? No, all warps load
-        // the SAME A tile. The B tile per warp has different N-rows.
-        // Let me just use: lane%4 gives the output column WITHIN this warp's MMA.
-        // With 8 warps × 4 cols = 32 cols per N-pass, not 64.
-        // This means we need 64/4 = 16 N-passes, not 8.
-        //
-        // Actually, the MMA is m16n8k64 but the effective output is m8n4.
-        // 8 warps × 4 cols = 32 unique output columns per N-pass.
-        // For GATE_UP/2 = 256 intermediate cols: 256/32 = 8 gate passes. Fine.
-        //
-        // FOR NOW: just store the 4 cols per warp that we know are correct.
-
+        // Output: each warp has 8 output columns (4 from q1, 4 from q2)
         if (warp_id < N_MMA_PER_BN) {
-            // B-row → output col mapping (empirically verified):
-            //   B-rows 0-3 → active quadrant cols 0-3 (for M≤4)
-            //   B-rows 4-7 → inactive quadrant (zero for M≤4)
-            //
-            // Weight matrix column = n_off + B-row-in-tile
-            // This warp's B-rows in tile: [warp_id*8 .. warp_id*8+7]
-            // Active B-rows: warp_id*8 + 0..3 → weight cols n_off + warp_id*8 + 0..3
-            //
-            // Output intermediate col = weight col (direct mapping for gate/up)
-            // Gate cols: 0..255 (weight rows 0..255)
-            // Up cols:   0..255 (weight rows 256..511, offset by GATE_UP/2)
-            int col_in_warp = lane_id % 4;
-            int weight_col = n_off + warp_id * 8 + col_in_warp;
-            int out_col = is_gate ? weight_col : (weight_col - GATE_UP / 2);
-            int m_group = lane_id / 8;  // 0..3 → M-rows 0..3
-
-            // Only lanes where m_group < M produce valid output
-            // For M=1: only m_group=0 (lanes 0-7) is valid
-            // d[0] = C[m_group, col], d[2] = C[m_group+4, col]
+            int c = lane_id % 4;
+            int m_group = lane_id / 8;
+            // q1: cols 0-3 → weight cols n_off + warp*8 + c
+            int col_q1 = is_gate ? (n_off + warp_id * 8 + c) : (n_off + warp_id * 8 + c - GATE_UP / 2);
+            // q2: cols 4-7 → weight cols n_off + warp*8 + 4 + c
+            int col_q2 = is_gate ? (n_off + warp_id * 8 + 4 + c) : (n_off + warp_id * 8 + 4 + c - GATE_UP / 2);
 
             if (is_gate) {
-                if (m_group < M && out_col < INTERMEDIATE) {
-                    s_gate[m_group * INTERMEDIATE + out_col] = acc[0];
-                }
-                // d[2] = row m_group+4 — only valid if M > 4
-                if (m_group + 4 < M && out_col < INTERMEDIATE) {
-                    s_gate[(m_group + 4) * INTERMEDIATE + out_col] = acc[2];
-                }
+                if (m_group < M && col_q1 < INTERMEDIATE)
+                    s_gate[m_group * INTERMEDIATE + col_q1] = acc_q1[0];
+                if (m_group + 4 < M && col_q1 < INTERMEDIATE)
+                    s_gate[(m_group + 4) * INTERMEDIATE + col_q1] = acc_q1[2];
+                if (m_group < M && col_q2 < INTERMEDIATE)
+                    s_gate[m_group * INTERMEDIATE + col_q2] = acc_q2[0];
+                if (m_group + 4 < M && col_q2 < INTERMEDIATE)
+                    s_gate[(m_group + 4) * INTERMEDIATE + col_q2] = acc_q2[2];
             } else {
                 __syncthreads();
-
-                float gate_val = 0;
-                if (m_group < M && out_col < INTERMEDIATE) {
-                    gate_val = s_gate[m_group * INTERMEDIATE + out_col];
-                    float swiglu = acc[0] * silu_f(gate_val);
-                    output[m_group * INTERMEDIATE + out_col] = __float2bfloat16(swiglu);
+                // SwiGLU: up * silu(gate) for both quadrants
+                if (m_group < M && col_q1 < INTERMEDIATE) {
+                    float gv = s_gate[m_group * INTERMEDIATE + col_q1];
+                    output[m_group * INTERMEDIATE + col_q1] = __float2bfloat16(acc_q1[0] * silu_f(gv));
                 }
-                if (m_group + 4 < M && out_col < INTERMEDIATE) {
-                    gate_val = s_gate[(m_group + 4) * INTERMEDIATE + out_col];
-                    float swiglu = acc[2] * silu_f(gate_val);
-                    output[(m_group + 4) * INTERMEDIATE + out_col] = __float2bfloat16(swiglu);
+                if (m_group + 4 < M && col_q1 < INTERMEDIATE) {
+                    float gv = s_gate[(m_group + 4) * INTERMEDIATE + col_q1];
+                    output[(m_group + 4) * INTERMEDIATE + col_q1] = __float2bfloat16(acc_q1[2] * silu_f(gv));
+                }
+                if (m_group < M && col_q2 < INTERMEDIATE) {
+                    float gv = s_gate[m_group * INTERMEDIATE + col_q2];
+                    output[m_group * INTERMEDIATE + col_q2] = __float2bfloat16(acc_q2[0] * silu_f(gv));
+                }
+                if (m_group + 4 < M && col_q2 < INTERMEDIATE) {
+                    float gv = s_gate[(m_group + 4) * INTERMEDIATE + col_q2];
+                    output[(m_group + 4) * INTERMEDIATE + col_q2] = __float2bfloat16(acc_q2[2] * silu_f(gv));
                 }
             }
         }
         __syncthreads();
-    }  // N-pass
+    }
 }
 
 // ============================================================================
