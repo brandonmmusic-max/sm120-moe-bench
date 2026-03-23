@@ -1,0 +1,79 @@
+#!/bin/bash
+# Patch: Reduce expert padding from all 512 to only active experts
+# Target: cutlass_fused_moe_kernels.cuh in flashinfer
+# Effect: Reduces padding loop from 65536 to 1280 iterations for M=1 decode
+
+FILE="/opt/venv/lib/python3.12/site-packages/flashinfer/data/csrc/fused_moe/cutlass_backend/cutlass_fused_moe_kernels.cuh"
+
+echo "Patching $FILE..."
+
+# 1. expandInputRowsKernelLauncher: change grid calculation
+# Original: int64_t num_padding_tokens = min_num_tokens_alignment * num_experts_per_node;
+# Patched:  uses min(experts, expanded_tokens) for grid AND passes to kernel
+python3 -c "
+import re, sys
+
+with open('$FILE', 'r') as f:
+    content = f.read()
+
+# Count occurrences to verify we're patching the right ones
+orig = 'int64_t num_padding_tokens = min_num_tokens_alignment * num_experts_per_node;'
+count = content.count(orig)
+print(f'Found {count} instances of original padding line')
+
+# Patch 1: expandInputRowsKernelLauncher (host-side, in #ifdef ENABLE_FP4 block near line 1575)
+# Only change the LAUNCHER instances (inside #ifdef ENABLE_FP4, before 'static int64_t const smCount')
+# The launcher has: num_rows and k parameters available
+
+# Patch 2: doActivation launcher (host-side, similar structure)
+# Has: expanded_num_tokens parameter available
+
+# Replace ALL instances with a version that caps at active experts
+# The kernel-side instances have expert_first_token_offset and num_experts_per_node
+# The host-side instances have num_rows*k or expanded_num_tokens
+
+# For the kernel body: add num_active_experts param
+# Actually, simplest: just cap in the kernel body using expert_first_token_offset[num_experts_per_node]
+# which gives total valid tokens — but we need active EXPERT count, not token count.
+
+# Simplest correct approach: in the kernel, after the main token loop,
+# only iterate padding for experts that have tokens
+# Current: for padding_token in 0..128*512: expert = padding_token/128; if expert has no tokens: skip
+# The skip is cheap (branch), but 65536 iterations × branch overhead adds up
+
+# Better: pass num_active (host knows it) as kernel arg and loop to 128*num_active
+# But changing kernel signatures is complex in this template-heavy code
+
+# Simplest viable: change the LAUNCHER grid to num_active and let kernel iterate its reduced grid
+# In launcher: num_padding_tokens = min_num_tokens_alignment * min(num_experts, tokens_count)
+
+new_expand = '''int64_t num_active_for_pad = std::min(static_cast<int64_t>(num_experts_per_node), num_rows * k);
+  int64_t num_padding_tokens = min_num_tokens_alignment * num_active_for_pad;'''
+
+new_activation = '''int64_t num_active_for_pad = std::min(static_cast<int64_t>(num_experts_per_node), expanded_num_tokens);
+  int64_t num_padding_tokens = min_num_tokens_alignment * num_active_for_pad;'''
+
+# We need to be careful about which occurrence is which.
+# Split by function boundaries and replace selectively.
+# Occurrences:
+# 1. expandInputRowsKernel (device) ~line 1531 — KEEP ORIGINAL (kernel iterates full range, grid limits it)
+# 2. expandInputRowsKernelLauncher (host) ~line 1576 — PATCH with num_rows * k
+# 3. doActivationKernel (device) ~line 2240 — KEEP ORIGINAL
+# 4. doActivation launcher (host) ~line 2282 — PATCH with expanded_num_tokens
+
+# Replace occurrence #2 and #4
+parts = content.split(orig)
+if len(parts) == 5:  # 4 occurrences = 5 parts
+    # Keep #1 (index 0-1 boundary), patch #2 (1-2), keep #3 (2-3), patch #4 (3-4)
+    result = parts[0] + orig + parts[1] + new_expand + parts[2] + orig + parts[3] + new_activation + parts[4]
+    with open('$FILE', 'w') as f:
+        f.write(result)
+    print('Patched occurrences 2 and 4 (launchers)')
+else:
+    print(f'ERROR: Expected 4 occurrences, found {len(parts)-1}')
+    sys.exit(1)
+"
+
+echo "Patch applied. Clearing JIT cache..."
+rm -rf /cache/jit/flashinfer/.cache/flashinfer/0.6.6/120a/cached_ops/fused_moe_120/
+echo "Done."
