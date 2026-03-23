@@ -110,9 +110,8 @@ class VerdictDenseGemm:
 
         self.cta_layout_mnk = cute.make_layout(self.cluster_shape_mnk)
 
-        # Use single stage for now (simpler, gets us to a working kernel)
-        # Multi-stage for pipelining in Sprint 4+
-        self.ab_stage = 1
+        # 2 stages for pipeline double-buffering
+        self.ab_stage = 2
         self.epi_stage = 1
 
         # SMEM layouts (needs tiled_mma which is created above)
@@ -159,16 +158,22 @@ class VerdictDenseGemm:
 
         return a_staged, b_staged, sfa_staged, sfb_staged, c_staged
 
-    def _make_tma_atoms_and_tensors(self, tensor, smem_layout_staged, smem_tile,
-                                     internal_type=None):
-        """Create TMA copy atom and global tensor for TMA loads."""
+    @staticmethod
+    def _make_tma_ab(tensor, smem_layout_staged, smem_tile):
+        """TMA atoms for A/B tensors (3D staged layout)."""
         op = cpasync.CopyBulkTensorTileG2SOp()
-        # Always slice to get 2D per-stage layout (even for stage=1)
         smem_layout = cute.slice_(smem_layout_staged, (None, None, 0))
-        tma_atom, tma_tensor = cpasync.make_tiled_tma_atom(
+        return cpasync.make_tiled_tma_atom(
+            op, tensor, smem_layout, smem_tile, num_multicast=1)
+
+    @staticmethod
+    def _make_tma_sf(tensor, smem_layout_staged, smem_tile):
+        """TMA atoms for SF tensors (4D staged layout: M_block, K_block, inner, stage)."""
+        op = cpasync.CopyBulkTensorTileG2SOp()
+        smem_layout = cute.slice_(smem_layout_staged, (None, None, None, 0))
+        return cpasync.make_tiled_tma_atom(
             op, tensor, smem_layout, smem_tile,
-            num_multicast=1, internal_type=internal_type)
-        return tma_atom, tma_tensor
+            num_multicast=1, internal_type=cutlass.Int16)
 
     # SF partition helpers (from CuteDSL block-scaled patterns)
     def _thrfrg_SFA(self, sfa_layout, thr_mma):
@@ -259,32 +264,19 @@ class VerdictDenseGemm:
         sfb_tensor = cute.make_tensor(sfb.iterator, sfb_layout)
 
         # TMA atoms — create one at a time to identify which fails
-        try:
-            tma_a, g_a = self._make_tma_atoms_and_tensors(
-                a, self.a_smem_layout_staged,
-                (self.tile_shape_mnk[0], self.tile_shape_mnk[2]))
-        except Exception as e:
-            raise RuntimeError(f"TMA A failed: {e}") from e
-        try:
-            tma_b, g_b = self._make_tma_atoms_and_tensors(
-                b, self.b_smem_layout_staged,
-                (self.tile_shape_mnk[1], self.tile_shape_mnk[2]))
-        except Exception as e:
-            raise RuntimeError(f"TMA B failed: {e}") from e
-        try:
-            tma_sfa, g_sfa = self._make_tma_atoms_and_tensors(
-                sfa_tensor, self.sfa_smem_layout_staged,
-                (self.tile_shape_mnk[0], self.tile_shape_mnk[2]),
-                internal_type=cutlass.Int16)
-        except Exception as e:
-            raise RuntimeError(f"TMA SFA failed: {e}") from e
-        try:
-            tma_sfb, g_sfb = self._make_tma_atoms_and_tensors(
-                sfb_tensor, self.sfb_smem_layout_staged,
-                (self.tile_shape_mnk[1], self.tile_shape_mnk[2]),
-                internal_type=cutlass.Int16)
-        except Exception as e:
-            raise RuntimeError(f"TMA SFB failed: {e}") from e
+        # TMA atoms
+        tma_a, g_a = self._make_tma_ab(
+            a, self.a_smem_layout_staged,
+            (self.tile_shape_mnk[0], self.tile_shape_mnk[2]))
+        tma_b, g_b = self._make_tma_ab(
+            b, self.b_smem_layout_staged,
+            (self.tile_shape_mnk[1], self.tile_shape_mnk[2]))
+        tma_sfa, g_sfa = self._make_tma_sf(
+            sfa_tensor, self.sfa_smem_layout_staged,
+            (self.tile_shape_mnk[0], self.tile_shape_mnk[2]))
+        tma_sfb, g_sfb = self._make_tma_sf(
+            sfb_tensor, self.sfb_smem_layout_staged,
+            (self.tile_shape_mnk[1], self.tile_shape_mnk[2]))
         # TMA store for C (epilogue)
         tma_c, g_c = self._make_tma_store_atoms_and_tensors(
             c, self.epi_smem_layout_staged, self.epi_tile)
