@@ -22,15 +22,17 @@ using namespace cute;
 // NVFP4 types
 using ElementA = cutlass::float_e2m1_t;
 using ElementB = cutlass::float_e2m1_t;
+// NVFP4 scale factors: ue8m0 with sf_vec=16 for SM120
 using ElementSF = cutlass::float_ue8m0_t;
 using ElementAcc = float;
 using ElementC = float;
 using ElementD = float;
 
-static constexpr int SFVec = 32;  // NVFP4 block-32
+static constexpr int SFVec = 16;  // NVFP4 block-16
 
-using ElementPairA = cute::tuple<ElementA, cute::tuple<ElementSF, cute::Int<SFVec>>>;
-using ElementPairB = cute::tuple<ElementB, cute::tuple<ElementSF, cute::Int<SFVec>>>;
+// 3-element flat tuple: (data_type, sf_type, sf_vec_size)
+using ElementPairA = cute::tuple<ElementA, ElementSF, cute::Int<SFVec>>;
+using ElementPairB = cute::tuple<ElementB, ElementSF, cute::Int<SFVec>>;
 
 using LayoutA = cutlass::layout::RowMajor;
 using LayoutB = cutlass::layout::ColumnMajor;
@@ -45,11 +47,11 @@ static constexpr int AlignB = 128 / cutlass::sizeof_bits<ElementB>::value;
 static constexpr int AlignC = 128 / cutlass::sizeof_bits<ElementC>::value;
 static constexpr int AlignD = 128 / cutlass::sizeof_bits<ElementD>::value;
 
-// Epilogue: simple identity (no bias, no activation)
-using EpilogueSchedule = cutlass::epilogue::PtrArrayNoSmemWarpSpecialized;
+// Epilogue: use SM90 NoSmem style (simpler, works for identity epilogue)
+using EpilogueSchedule = cutlass::epilogue::NoSmemWarpSpecialized;
 
 using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
-    cutlass::arch::Sm120,
+    cutlass::arch::Sm90,  // SM90 epilogue builder works for SM120
     cutlass::arch::OpClassTensorOp,
     TileShape, ClusterShape,
     cutlass::epilogue::collective::EpilogueTileAuto,
@@ -62,7 +64,8 @@ using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBui
 using StageCount = cutlass::gemm::collective::StageCountAutoCarveout<
     static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>;
 
-using KernelSchedule = cutlass::gemm::KernelTmaWarpSpecializedCooperativeBlockScaledSm120<3>;
+// SM120 NVFP4 (E2M1×E2M1) kernel schedule
+using KernelSchedule = cutlass::gemm::KernelTmaWarpSpecializedNvf4Sm120;
 
 using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
     cutlass::arch::Sm120,
@@ -118,16 +121,43 @@ int main() {
 
     printf("Running GEMM [%d, %d] x [%d, %d]...\n", M, K, K, N);
 
+    // Use the StrideA type directly (data stride only, SF stride auto-derived)
+    auto stride_A = cutlass::make_cute_packed_stride(typename CollectiveMainloop::StrideA{}, {M, K, 1});
+    auto stride_B = cutlass::make_cute_packed_stride(typename CollectiveMainloop::StrideB{}, {N, K, 1});
+    auto stride_C = cutlass::make_cute_packed_stride(typename CollectiveEpilogue::StrideC{}, {M, N, 1});
+    auto stride_D = cutlass::make_cute_packed_stride(typename CollectiveEpilogue::StrideD{}, {M, N, 1});
+
+    // Construct SF layouts using the block-scaled layout config
+    // LayoutSFA = blocked_product(SfAtom, make_layout(shape(M,K,L), stride(M_stride,1,L_stride)))
+    using BlkScaledConfig = cutlass::detail::Sm1xxBlockScaledConfig<SFVec>;
+    int K_sf = K / SFVec;  // number of SF blocks along K
+    int M_sf_stride = K_sf;  // SF elements per M-row
+    int L_sf_stride = M * K_sf;  // batch stride
+
+    auto layout_sfa = blocked_product(
+        typename BlkScaledConfig::SfAtom{},
+        make_layout(make_shape(M, K, 1),
+                    make_stride(M_sf_stride, cute::_1{}, L_sf_stride)));
+    auto layout_sfb = blocked_product(
+        typename BlkScaledConfig::SfAtom{},
+        make_layout(make_shape(N, K, 1),
+                    make_stride(K_sf, cute::_1{}, N * K_sf)));
+
+    typename CollectiveMainloop::Arguments mainloop_args;
+    mainloop_args.ptr_A = (ElementA*)dA;
+    mainloop_args.dA = stride_A;
+    mainloop_args.ptr_B = (ElementB*)dB;
+    mainloop_args.dB = stride_B;
+    mainloop_args.ptr_SFA = (ElementSF*)dSFA;
+    mainloop_args.layout_SFA = layout_sfa;
+    mainloop_args.ptr_SFB = (ElementSF*)dSFB;
+    mainloop_args.layout_SFB = layout_sfb;
+
     typename Gemm::Arguments args{
         cutlass::gemm::GemmUniversalMode::kGemm,
-        {M, N, K, 1},  // problem shape (M, N, K, L)
-        {(ElementA*)dA, cutlass::make_cute_packed_stride(typename CollectiveMainloop::StrideA{}, {M, K, 1}),
-         (ElementB*)dB, cutlass::make_cute_packed_stride(typename CollectiveMainloop::StrideB{}, {N, K, 1}),
-         (ElementSF*)dSFA, {},  // SF stride
-         (ElementSF*)dSFB, {}},
-        {{1.0f, 0.0f},
-         dC, cutlass::make_cute_packed_stride(typename CollectiveEpilogue::StrideC{}, {M, N, 1}),
-         dD, cutlass::make_cute_packed_stride(typename CollectiveEpilogue::StrideD{}, {M, N, 1})}
+        {M, N, K, 1},
+        mainloop_args,
+        {{1.0f, 0.0f}, dC, stride_C, dD, stride_D}
     };
 
     Gemm gemm;
