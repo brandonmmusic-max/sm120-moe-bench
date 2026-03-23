@@ -110,76 +110,63 @@ class VerdictDenseGemm:
 
         self.cta_layout_mnk = cute.make_layout(self.cluster_shape_mnk)
 
-        sfa_per_stage = make_smem_layout_sfa(
-            self.tiled_mma, self.tile_shape_mnk, self.sf_vec_size, 1
-        )
-        sfb_per_stage = make_smem_layout_sfb(
-            self.tiled_mma, self.tile_shape_mnk, self.sf_vec_size, 1
-        )
+        # Compute pipeline stages — for now use 2 (safe for 99KB SMEM)
+        self.ab_stage = 2
+        self.epi_stage = 1
 
-        self.ab_stage, self.epi_stage = self._compute_stages(
-            self.tile_shape_mnk, self.a_dtype, self.b_dtype, self.sf_dtype,
-            sfa_per_stage, sfb_per_stage, self.epi_tile, self.c_dtype,
-            self.smem_capacity, 1
-        )
-
+        # SMEM layouts (needs tiled_mma which is created above)
         self.a_smem_layout_staged, self.b_smem_layout_staged, \
             self.sfa_smem_layout_staged, self.sfb_smem_layout_staged, \
-            self.epi_smem_layout_staged = self._make_smem_layouts(
-                self.tile_shape_mnk, self.epi_tile,
-                self.a_dtype, self.a_layout, self.b_dtype, self.b_layout,
-                self.ab_stage, self.c_dtype, self.c_layout, self.epi_stage,
-                self.sf_vec_size, self.tiled_mma
-            )
+            self.epi_smem_layout_staged = self._make_smem_layouts()
 
-    @staticmethod
-    def _compute_stages(tile_shape_mnk, a_dtype, b_dtype, sf_dtype,
-                        sfa_per_stage, sfb_per_stage, epi_tile, c_dtype,
-                        smem_capacity, occupancy):
-        """Compute pipeline stages that fit SMEM budget."""
-        tile_m, tile_n, tile_k = tile_shape_mnk
-        a_bytes = cutlass.sizeof_bits(a_dtype) * tile_m * tile_k // 8
-        b_bytes = cutlass.sizeof_bits(b_dtype) * tile_n * tile_k // 8
-        sfa_bytes = cute.cosize(sfa_per_stage) * cutlass.sizeof_bits(sf_dtype) // 8
-        sfb_bytes = cute.cosize(sfb_per_stage) * cutlass.sizeof_bits(sf_dtype) // 8
-        ab_per_stage = a_bytes + b_bytes + sfa_bytes + sfb_bytes + 1024  # alignment
+    def _make_smem_layouts(self):
+        """Create staged SMEM layouts using SM90 (Hopper) style atoms.
+        SM120 uses Hopper-style SMEM layout since it doesn't have tcgen05."""
+        import cutlass.utils.hopper_helpers as sm90_utils
 
-        epi_bytes = cutlass.sizeof_bits(c_dtype) * epi_tile[0] * epi_tile[1] // 8 + 1024
+        # A: K-major (TN layout)
+        a_smem_shape = cute.slice_(self.tile_shape_mnk, (None, 0, None))
+        a_atom = cute.nvgpu.warpgroup.make_smem_layout_atom(
+            sm90_utils.get_smem_layout_atom(
+                self.a_layout, self.a_dtype, self.tile_shape_mnk[2]),
+            self.a_dtype)
+        a_staged = cute.tile_to_shape(
+            a_atom, cute.append(a_smem_shape, self.ab_stage), order=(0, 1, 2))
 
-        usable = smem_capacity // occupancy
-        # Reserve space for epilogue
-        mainloop_budget = usable - epi_bytes
-        ab_stage = max(2, mainloop_budget // ab_per_stage)
-        epi_stage = 1
-        return ab_stage, epi_stage
+        # B: K-major (TN layout)
+        b_smem_shape = cute.slice_(self.tile_shape_mnk, (0, None, None))
+        b_atom = cute.nvgpu.warpgroup.make_smem_layout_atom(
+            sm90_utils.get_smem_layout_atom(
+                self.b_layout, self.b_dtype, self.tile_shape_mnk[2]),
+            self.b_dtype)
+        b_staged = cute.tile_to_shape(
+            b_atom, cute.append(b_smem_shape, self.ab_stage), order=(0, 1, 2))
 
-    def _make_smem_layouts(self, tile_shape_mnk, epi_tile, a_dtype, a_layout,
-                           b_dtype, b_layout, ab_stage, c_dtype, c_layout,
-                           epi_stage, sf_vec_size, tiled_mma):
-        """Create staged SMEM layouts for A, B, SFA, SFB, C."""
-        a_staged = sm120_utils.make_smem_layout_a(
-            a_dtype, tile_shape_mnk, ab_stage, sf_vec_size)
-        b_staged = sm120_utils.make_smem_layout_b(
-            b_dtype, tile_shape_mnk, ab_stage, sf_vec_size)
+        # SF layouts
         sfa_staged = blockscaled_utils.make_smem_layout_sfa(
-            tiled_mma, tile_shape_mnk, sf_vec_size, ab_stage)
+            self.tiled_mma, self.tile_shape_mnk, self.sf_vec_size, self.ab_stage)
         sfb_staged = blockscaled_utils.make_smem_layout_sfb(
-            tiled_mma, tile_shape_mnk, sf_vec_size, ab_stage)
-        c_staged = sm120_utils.make_smem_layout_epi(
-            c_dtype, epi_tile, epi_stage)
+            self.tiled_mma, self.tile_shape_mnk, self.sf_vec_size, self.ab_stage)
+
+        # Epilogue (C output)
+        c_atom = cute.nvgpu.warpgroup.make_smem_layout_atom(
+            sm90_utils.get_smem_layout_atom(
+                self.c_layout, self.c_dtype, self.epi_tile[1]),
+            self.c_dtype)
+        c_staged = cute.tile_to_shape(
+            c_atom, cute.append(self.epi_tile, self.epi_stage), order=(0, 1, 2))
+
         return a_staged, b_staged, sfa_staged, sfb_staged, c_staged
 
-    def _make_tma_atoms_and_tensors(self, tensor, smem_layout, tile_shape, stage,
+    @staticmethod
+    def _make_tma_atoms_and_tensors(tensor, smem_layout_staged, smem_tile,
                                      internal_type=None):
         """Create TMA copy atom and global tensor for TMA loads."""
-        tma_atom = cute.make_tma_copy(
-            cute.nvgpu.TmaLoadOp(),
-            tensor,
-            smem_layout if stage == 1 else cute.slice_(smem_layout, (None, None, 0)),
-            tile_shape,
-            internal_type=internal_type,
-        )
-        tma_tensor = cute.make_tma_tensor(tma_atom, tensor)
+        op = cpasync.CopyBulkTensorTileG2SOp()
+        smem_layout = cute.slice_(smem_layout_staged, (None, None, 0))
+        tma_atom, tma_tensor = cpasync.make_tiled_tma_atom(
+            op, tensor, smem_layout, smem_tile,
+            num_multicast=1, internal_type=internal_type)
         return tma_atom, tma_tensor
 
     # SF partition helpers (from CuteDSL block-scaled patterns)
@@ -252,39 +239,40 @@ class VerdictDenseGemm:
         stream: cuda.CUstream,
     ):
         """Launch the GEMM kernel."""
-        self.a_dtype = a.element_type
-        self.b_dtype = b.element_type
-        self.c_dtype = c.element_type
-        self.sf_dtype = sfa.element_type
+        # Set layout enums and dtypes (fixed for NVF4)
+        self.a_layout = utils.LayoutEnum.ROW_MAJOR
+        self.b_layout = utils.LayoutEnum.COL_MAJOR
+        self.c_layout = utils.LayoutEnum.ROW_MAJOR
+        self.a_dtype = cutlass.Float4E2M1FN
+        self.b_dtype = cutlass.Float4E2M1FN
+        self.sf_dtype = cutlass.Float8E4M3FN
         self.acc_dtype = cutlass.Float32
-
-        self.a_layout = utils.LayoutEnum.from_tensor(a)
-        self.b_layout = utils.LayoutEnum.from_tensor(b)
-        self.c_layout = utils.LayoutEnum.from_tensor(c)
+        self.c_dtype = cutlass.BFloat16
 
         self._setup_attributes()
 
-        # SF tensor layouts
+        # SF tensor layouts from A/B shapes
         sfa_layout = blockscaled_utils.tile_atom_to_shape_SF(a.shape, self.sf_vec_size)
         sfb_layout = blockscaled_utils.tile_atom_to_shape_SF(b.shape, self.sf_vec_size)
         sfa_tensor = cute.make_tensor(sfa.iterator, sfa_layout)
         sfb_tensor = cute.make_tensor(sfb.iterator, sfb_layout)
 
-        # TMA atoms
+        # TMA atoms for A, B, SFA, SFB
         tma_a, g_a = self._make_tma_atoms_and_tensors(
             a, self.a_smem_layout_staged,
-            (self.tile_shape_mnk[0], self.tile_shape_mnk[2]), self.ab_stage)
+            (self.tile_shape_mnk[0], self.tile_shape_mnk[2]))
         tma_b, g_b = self._make_tma_atoms_and_tensors(
             b, self.b_smem_layout_staged,
-            (self.tile_shape_mnk[1], self.tile_shape_mnk[2]), self.ab_stage)
+            (self.tile_shape_mnk[1], self.tile_shape_mnk[2]))
         tma_sfa, g_sfa = self._make_tma_atoms_and_tensors(
             sfa_tensor, self.sfa_smem_layout_staged,
-            (self.tile_shape_mnk[0], self.tile_shape_mnk[2]), self.ab_stage,
+            (self.tile_shape_mnk[0], self.tile_shape_mnk[2]),
             internal_type=cutlass.Int16)
         tma_sfb, g_sfb = self._make_tma_atoms_and_tensors(
             sfb_tensor, self.sfb_smem_layout_staged,
-            (self.tile_shape_mnk[1], self.tile_shape_mnk[2]), self.ab_stage,
+            (self.tile_shape_mnk[1], self.tile_shape_mnk[2]),
             internal_type=cutlass.Int16)
+        # TMA store for C (epilogue)
         tma_c, g_c = self._make_tma_store_atoms_and_tensors(
             c, self.epi_smem_layout_staged, self.epi_tile)
 
@@ -330,28 +318,23 @@ class VerdictDenseGemm:
             stream=stream,
         )
 
-    def _make_tma_store_atoms_and_tensors(self, tensor, smem_layout, tile_shape):
+    @staticmethod
+    def _make_tma_store_atoms_and_tensors(tensor, smem_layout_staged, tile_shape):
         """TMA store atom for epilogue."""
-        tma_atom = cute.make_tma_copy(
-            cute.nvgpu.TmaStoreOp(),
-            tensor,
-            cute.slice_(smem_layout, (None, None, 0)),
-            tile_shape,
-        )
-        tma_tensor = cute.make_tma_tensor(tma_atom, tensor)
+        op = cpasync.CopyBulkTensorTileS2GOp()
+        smem_layout = cute.slice_(smem_layout_staged, (None, None, 0))
+        tma_atom, tma_tensor = cpasync.make_tiled_tma_atom(
+            op, tensor, smem_layout, tile_shape, num_multicast=1)
         return tma_atom, tma_tensor
 
     def _compute_grid(self, c_tensor, tile_shape, max_active_clusters):
         """Compute persistent tile scheduler grid."""
-        M, N = c_tensor.shape[0], c_tensor.shape[1]
+        M = cute.size(c_tensor, mode=[0])
+        N = cute.size(c_tensor, mode=[1])
         tiles_m = (M + tile_shape[0] - 1) // tile_shape[0]
         tiles_n = (N + tile_shape[1] - 1) // tile_shape[1]
-
-        import math
-        from b12x.cute.utils import get_num_sm, get_max_active_clusters as gac
-        num_sm = 188  # RTX PRO 6000
         total_tiles = tiles_m * tiles_n
-        grid_size = min(total_tiles, num_sm)
+        grid_size = min(total_tiles, 188)  # 188 SMs on RTX PRO 6000
 
         params = utils.PersistentTileSchedulerParams(
             tiles_m=tiles_m, tiles_n=tiles_n, tiles_l=1,
@@ -583,16 +566,79 @@ class VerdictDenseGemm:
 
 # Host-side test
 def test_dense_gemm():
-    """Test VerdictDenseGemm compilation."""
-    print("VerdictDenseGemm: testing configuration...")
+    """Test VerdictDenseGemm — full JIT compile and run."""
+    import torch
+    print("VerdictDenseGemm: full JIT test...")
+
     gemm = VerdictDenseGemm(sf_vec_size=16, mma_tiler_mn=(128, 128))
-    print(f"  Tile: {gemm.tile_shape_mnk}")
-    print(f"  Threads: {gemm.threads_per_cta}")
-    print(f"  MMA warps: {gemm.num_mma_warps}")
-    print(f"  SMEM: {gemm.smem_capacity} bytes")
-    print(f"  tile_k: {gemm.tile_k}")
-    print(f"  sf_vec_size: {gemm.sf_vec_size}")
-    print("  Configuration OK!")
+    print(f"  Tile: {gemm.tile_shape_mnk}, Threads: {gemm.threads_per_cta}")
+
+    M, N, K = 128, 128, 128  # Single tile
+    torch.manual_seed(42)
+
+    # Create FP4 quantized tensors
+    a_f32 = torch.randn(M, K, device="cuda") * 0.5
+    b_f32 = torch.randn(N, K, device="cuda") * 0.5
+
+    # Quantize
+    from test_gemm_cutedsl import nvfp4_quantize, nvfp4_dequantize, reference_gemm
+    a_packed, a_sf = nvfp4_quantize(a_f32, sf_vec_size=16)
+    b_packed, b_sf = nvfp4_quantize(b_f32, sf_vec_size=16)
+
+    # Quantized reference
+    a_deq = nvfp4_dequantize(a_packed, a_sf, sf_vec_size=16)
+    b_deq = nvfp4_dequantize(b_packed, b_sf, sf_vec_size=16)
+    c_ref = reference_gemm(a_deq, b_deq)
+    print(f"  Quant ref[0,0:4]: {c_ref[0, :4].tolist()}")
+
+    # Output
+    c_out = torch.zeros(M, N, dtype=torch.bfloat16, device="cuda")
+    alpha = torch.ones(1, dtype=torch.float32, device="cuda")
+
+    # Use cute.compile to pre-compile, then run with data pointers
+    from cutlass.cute.runtime import make_ptr
+
+    print("  Compiling kernel via cute.compile...")
+
+    # Wrapper that creates tensors inside JIT context
+    @cute.jit
+    def run_gemm(a_ptr, b_ptr, sfa_ptr, sfb_ptr, c_ptr, alpha_ptr, stream_arg):
+        # 3D layouts: (rows, cols, batch=1) — required for tile_atom_to_shape_SF
+        a_t = cute.make_tensor(a_ptr, cute.make_layout((M, K, 1)))
+        b_t = cute.make_tensor(b_ptr, cute.make_layout((N, K, 1)))
+        sfa_t = cute.make_tensor(sfa_ptr, cute.make_layout((M, K // 16, 1)))
+        sfb_t = cute.make_tensor(sfb_ptr, cute.make_layout((N, K // 16, 1)))
+        c_t = cute.make_tensor(c_ptr, cute.make_layout((M, N, 1)))
+        alpha_t = cute.make_tensor(alpha_ptr, cute.make_layout((1,)))
+        gemm(a_t, b_t, sfa_t, sfb_t, c_t, alpha_t, 1, stream_arg)
+
+    a_ptr = make_ptr(cutlass.Float4E2M1FN, a_packed.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
+    b_ptr = make_ptr(cutlass.Float4E2M1FN, b_packed.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
+    sfa_ptr = make_ptr(cutlass.Float8E4M3FN, a_sf.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
+    sfb_ptr = make_ptr(cutlass.Float8E4M3FN, b_sf.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
+    c_ptr = make_ptr(cutlass.BFloat16, c_out.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
+    alpha_ptr = make_ptr(cutlass.Float32, alpha.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
+
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+
+    print("  Launching JIT kernel...")
+    try:
+        run_gemm(a_ptr, b_ptr, sfa_ptr, sfb_ptr, c_ptr, alpha_ptr, stream)
+        torch.cuda.synchronize()
+        print(f"  Kernel output[0,0:4]: {c_out[0, :4].float().tolist()}")
+
+        # Compare
+        err = (c_ref.bfloat16().float() - c_out.float()).abs().mean()
+        ref_rms = c_ref.abs().mean()
+        rel = err / ref_rms if ref_rms > 0 else 0
+        print(f"  vs quant ref: rel_err = {rel:.1%}")
+        if rel < 0.05:
+            print("  PASS!")
+        else:
+            print(f"  FAIL (expected <5% additional error)")
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
 
 
 if __name__ == "__main__":
