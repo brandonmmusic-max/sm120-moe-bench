@@ -2,9 +2,15 @@
 """
 VerdictMoE — Fused MoE expert backend for SM120 Blackwell.
 
-Fuses GEMM1 + SwiGLU + E4M3 requant + GEMM2 into a 3-kernel pipeline
+Fuses GEMM1 + SwiGLU + E4M3 requant + GEMM2 into a multi-kernel pipeline
 with on-the-fly NVFP4 dequantization. Eliminates GMEM round-trips between
 GEMM1->activation->GEMM2.
+
+Two backend paths:
+  - Scalar GEMV (default): verdict_moe_ext.cu — 4-kernel pipeline
+  - MMA tensor core:       verdict_mma_ext.cu — 5-kernel pipeline with
+    NVF4 MMA m16n8k64, Swizzle<3,4,3>, per-register rescaling
+    Enabled via: VLLM_VERDICT_MMA=1
 
 Grid: num_active_experts x 64 N-tiles = 640 CTAs across 188 SMs.
 Weight format: NVFP4 (E2M1 packed uint8 + E4M3FN block scales).
@@ -42,12 +48,24 @@ from vllm.platforms import current_platform
 logger = logging.getLogger(__name__)
 
 # ============================================================================
-# JIT-compile the CUDA extension
+# JIT-compile the CUDA extensions
 # ============================================================================
 _verdict_ext = None
+_verdict_mma_ext = None
+
+# MMA path toggle: VLLM_VERDICT_MMA=1 enables MMA tensor core path
+_USE_MMA = os.environ.get("VLLM_VERDICT_MMA", "0") == "1"
+
+_CUDA_FLAGS = [
+    "-gencode=arch=compute_120a,code=sm_120a",
+    "-O2",
+    "--expt-relaxed-constexpr",
+    "-use_fast_math",
+]
 
 
 def _get_verdict_ext():
+    """Load the scalar GEMV extension (fallback / default path)."""
     global _verdict_ext
     if _verdict_ext is not None:
         return _verdict_ext
@@ -60,20 +78,40 @@ def _get_verdict_ext():
     if not ext_src.exists():
         raise FileNotFoundError(f"VerdictMoE CUDA source not found: {ext_src}")
 
-    logger.info("JIT-compiling VerdictMoE CUDA extension (SM120)...")
+    logger.info("JIT-compiling VerdictMoE scalar CUDA extension (SM120)...")
     _verdict_ext = load(
         name="verdict_moe_ext",
         sources=[str(ext_src)],
-        extra_cuda_cflags=[
-            "-gencode=arch=compute_120a,code=sm_120a",
-            "-O2",
-            "--expt-relaxed-constexpr",
-            "-use_fast_math",
-        ],
+        extra_cuda_cflags=_CUDA_FLAGS,
         verbose=False,
     )
-    logger.info("VerdictMoE CUDA extension compiled successfully")
+    logger.info("VerdictMoE scalar CUDA extension compiled successfully")
     return _verdict_ext
+
+
+def _get_verdict_mma_ext():
+    """Load the MMA tensor core extension (NVF4 m16n8k64 + Swizzle<3,4,3>)."""
+    global _verdict_mma_ext
+    if _verdict_mma_ext is not None:
+        return _verdict_mma_ext
+
+    from torch.utils.cpp_extension import load
+
+    csrc_dir = Path(__file__).parent / "csrc"
+    ext_src = csrc_dir / "verdict_mma_ext.cu"
+
+    if not ext_src.exists():
+        raise FileNotFoundError(f"VerdictMoE MMA CUDA source not found: {ext_src}")
+
+    logger.info("JIT-compiling VerdictMoE MMA CUDA extension (SM120)...")
+    _verdict_mma_ext = load(
+        name="verdict_mma_ext",
+        sources=[str(ext_src)],
+        extra_cuda_cflags=_CUDA_FLAGS,
+        verbose=False,
+    )
+    logger.info("VerdictMoE MMA CUDA extension compiled successfully")
+    return _verdict_mma_ext
 
 
 # ============================================================================
@@ -233,6 +271,34 @@ class VerdictMoEExperts(mk.FusedMoEExpertsModular):
             max_active, dtype=torch.float32, device=device,
         )
 
+        # --- MMA-specific FP4 buffers (only allocated if MMA enabled) ---
+        SF_BLOCK_ACT = 32  # UE8M0 quantization block size for activations
+        if _USE_MMA:
+            # Input FP4: quantized BF16 input
+            self._buf_input_fp4 = torch.empty(
+                max_tokens * (K // 2),
+                dtype=torch.uint8, device=device,
+            )
+            self._buf_input_sf = torch.empty(
+                max_tokens * (K // SF_BLOCK_ACT),
+                dtype=torch.uint8, device=device,
+            )
+            # Intermediate FP4: SwiGLU output
+            self._buf_inter_fp4 = torch.empty(
+                max_active * (N_half // 2),
+                dtype=torch.uint8, device=device,
+            )
+            self._buf_inter_sf = torch.empty(
+                max_active * (N_half // SF_BLOCK_ACT),
+                dtype=torch.uint8, device=device,
+            )
+            logger.info(
+                "VerdictMoE MMA FP4 buffers: input_fp4=%.1f KB, "
+                "inter_fp4=%.1f KB",
+                (self._buf_input_fp4.nbytes + self._buf_input_sf.nbytes) / 1024,
+                (self._buf_inter_fp4.nbytes + self._buf_inter_sf.nbytes) / 1024,
+            )
+
         # Store dimensions for debug/validation
         self._buf_K = K
         self._buf_N_half = N_half
@@ -252,10 +318,16 @@ class VerdictMoEExperts(mk.FusedMoEExpertsModular):
             + self._buf_w2_alpha_all.nbytes
             + self._buf_ones.nbytes
         )
+        if _USE_MMA:
+            total_bytes += (
+                self._buf_input_fp4.nbytes + self._buf_input_sf.nbytes
+                + self._buf_inter_fp4.nbytes + self._buf_inter_sf.nbytes
+            )
         logger.info(
             "VerdictMoE buffers allocated: %.1f MB "
-            "(max_tokens=%d, max_topk=%d, K=%d, N_half=%d)",
+            "(max_tokens=%d, max_topk=%d, K=%d, N_half=%d, mma=%s)",
             total_bytes / 1e6, max_tokens, max_topk, K, N_half,
+            "ON" if _USE_MMA else "OFF",
         )
 
     _buffers_ready = False
@@ -281,8 +353,6 @@ class VerdictMoEExperts(mk.FusedMoEExpertsModular):
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
         apply_router_weight_on_input: bool,
     ):
-        ext = _get_verdict_ext()
-
         e, m, n, k, topk_val = self.moe_problem_size(
             hidden_states, w1, w2, topk_ids
         )
@@ -362,7 +432,6 @@ class VerdictMoEExperts(mk.FusedMoEExpertsModular):
             num_active * tiles_per_expert * 2 * N_half,
             dtype=torch.float32, device=device,
         )
-        gmem_inter = self._buf_gmem_inter[:num_active * N_half]
         output_f32 = self._buf_output_f32[:m * k]
 
         # --- Cast block scales to uint8 (view, no allocation) ---
@@ -375,7 +444,37 @@ class VerdictMoEExperts(mk.FusedMoEExpertsModular):
         else:
             wts_for_kernel = expert_wts_flat
 
-        # --- Launch VerdictMoE 3-kernel pipeline ---
+        # --- Dispatch: MMA or scalar path ---
+        if _USE_MMA:
+            self._apply_mma(
+                output, hidden_states, w1, w2,
+                w1_sf, w2_sf, w1_alpha, w2_alpha,
+                expert_ids_flat, wts_for_kernel, token_ids_flat,
+                partials, output_f32,
+                k, N_half, num_active, tiles_per_expert, m,
+            )
+        else:
+            self._apply_scalar(
+                output, hidden_states, w1, w2,
+                w1_sf, w2_sf, w1_alpha, w2_alpha,
+                expert_ids_flat, wts_for_kernel, token_ids_flat,
+                partials, output_f32,
+                k, N_half, num_active, tiles_per_expert,
+            )
+
+    # ========================================================================
+    # Scalar GEMV path (original, validated)
+    # ========================================================================
+    def _apply_scalar(
+        self, output, hidden_states, w1, w2,
+        w1_sf, w2_sf, w1_alpha, w2_alpha,
+        expert_ids_flat, wts_for_kernel, token_ids_flat,
+        partials, output_f32,
+        k, N_half, num_active, tiles_per_expert,
+    ):
+        ext = _get_verdict_ext()
+        gmem_inter = self._buf_gmem_inter[:num_active * N_half]
+
         # output_f32 is zeroed by cudaMemsetAsync inside the CUDA extension
         ext.forward(
             hidden_states.contiguous(),
@@ -392,5 +491,47 @@ class VerdictMoEExperts(mk.FusedMoEExpertsModular):
             partials,
             gmem_inter,
             output_f32,
+            k, N_half, num_active, tiles_per_expert,
+        )
+
+    # ========================================================================
+    # MMA tensor core path (NVF4 m16n8k64 + Swizzle<3,4,3>)
+    # ========================================================================
+    def _apply_mma(
+        self, output, hidden_states, w1, w2,
+        w1_sf, w2_sf, w1_alpha, w2_alpha,
+        expert_ids_flat, wts_for_kernel, token_ids_flat,
+        partials, output_f32,
+        k, N_half, num_active, tiles_per_expert, m,
+    ):
+        ext_mma = _get_verdict_mma_ext()
+
+        # Slice pre-allocated FP4 buffers
+        input_fp4 = self._buf_input_fp4[:m * (k // 2)]
+        input_sf = self._buf_input_sf[:m * (k // 32)]
+        inter_fp4 = self._buf_inter_fp4[:num_active * (N_half // 2)]
+        inter_sf = self._buf_inter_sf[:num_active * (N_half // 32)]
+
+        # 5-kernel MMA pipeline:
+        #   K0: BF16→NVFP4 | K1: GEMM1 MMA | K2: SwiGLU+FP4 |
+        #   K3: GEMM2 MMA+scatter | K4: F32→BF16
+        ext_mma.forward(
+            hidden_states.contiguous(),
+            w1.contiguous(),
+            w1_sf.contiguous(),
+            w1_alpha,
+            w2.contiguous(),
+            w2_sf.contiguous(),
+            w2_alpha,
+            output,
+            expert_ids_flat,
+            wts_for_kernel,
+            token_ids_flat,
+            partials,
+            output_f32,
+            input_fp4,
+            input_sf,
+            inter_fp4,
+            inter_sf,
             k, N_half, num_active, tiles_per_expert,
         )
