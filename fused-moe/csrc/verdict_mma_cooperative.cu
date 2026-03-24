@@ -1,10 +1,12 @@
 /**
- * VerdictMoE Phase 3: Cooperative MMA Kernel for SM120
+ * VerdictMoE Sprint 4 Task 2: Cooperative MMA Kernel with Swizzle Pipeline
  *
- * Single cooperative kernel launch for all 10 active experts (M=1 decode).
- * Uses NVF4 MMA (m16n8k64) for both GEMM1 and GEMM2 with FP4 block-scaled weights.
- * TMA-style async loads via ldmatrix.b4x16_p64.
- * Fused GEMM1 -> SwiGLU -> GEMM2 with grid.sync() between stages.
+ * Fixes from Task 1 validation (empirically determined hardware layout):
+ * - pack_a_m1_v2: group g=tid/4 -> M=2*g; a[0]/a[2]=M-even, a[1]/a[3]=M-odd
+ * - pack_b_v2: group g=tid/4 -> N=4*(g%2)+g/2; both b[0]/b[1] same N
+ * - C output: d[0]=C[2*(tid/4), tid%4], d[1]=C[2*(tid/4), tid%4+4]
+ * - SFB per-thread-group (each group's N column gets its own scale)
+ * - SMEM writes/reads use Swizzle<3,4,3> for ldmatrix-compatible layout
  *
  * Dimensions (Qwen3.5-397B-A17B, EP=4):
  *   K=4096 (hidden), N_half=1024 (intermediate), 10 active experts, M=1
@@ -65,76 +67,147 @@ static constexpr int SMEM_SFA = 16;                       // aligned
 static constexpr int SMEM_SFB = BN * (BK / SF_BLOCK);    // 128
 static constexpr int SMEM_TOTAL = SMEM_A + SMEM_B + SMEM_SFA + SMEM_SFB + 256;
 
-// E2M1 value table
+// E2M1 value table (host only - device code uses inline function)
 static const float E2M1_TABLE[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
 
-// ============================================================================
-// PTX Inline Helpers
-// ============================================================================
-
-// ============================================================================
-// Register packing per cute ALayout/BLayout traits for NVF4 m16n8k64
-// ============================================================================
-// ALayout: (T32,V32) → (M16,K64) with strides ((128,1),(16,8,512))
-//   Thread t: t0=t%4, t1=t/4. Only t0=0 threads have M=0 data.
-//   Reg 0 nibbles 0-3: K={t1, t1+16, t1+32, t1+48} at M=0
-//   Reg 0 nibbles 4-7: M=1 (zero for M=1 input)
-//   Reg 1 nibbles 0-3: K={t1+8, t1+24, t1+40, t1+56} at M=0
-//   Reg 1 nibbles 4-7: M=1 (zero)
-//   Regs 2-3: M≥8 (zero)
-//
-// BLayout: (T32,V16) → (N8,K64) with strides ((64,1),(8,256))
-//   Thread t: t0=t%4, t1=t/4
-//   Reg 0 (8 nibbles): N=t0, K={t1, t1+8, t1+16, ..., t1+56}
-//   Reg 1 (8 nibbles): N=t0+4, K={t1, t1+8, ..., t1+56}
-//
-// CLayout: SM80_16x8_Row: (T32,V4) → (M16,N8) strides ((32,1),(16,8))
-//   M=0 output: only threads with t%4==0, d[0] only, N=t/4
-
-__device__ __forceinline__ uint32_t get_nibble(const uint8_t* smem, int k) {
-    uint8_t byte = smem[k / 2];
-    return (k & 1) ? ((byte >> 4) & 0xFu) : (byte & 0xFu);
+// Device-side E2M1 lookup (avoids __constant__ issues with -rdc=true)
+__device__ __forceinline__ float d_e2m1_val(int idx) {
+    // Computed inline to avoid constant memory with relocatable device code
+    switch (idx & 7) {
+        case 0: return 0.0f;
+        case 1: return 0.5f;
+        case 2: return 1.0f;
+        case 3: return 1.5f;
+        case 4: return 2.0f;
+        case 5: return 3.0f;
+        case 6: return 4.0f;
+        case 7: return 6.0f;
+    }
+    return 0.0f;
 }
 
-// Pack A registers for M=1 input (only row 0 of A tile has data)
-// s_A: [BM=16, BK/2=32] row-major, row 0 = input FP4 data
-__device__ __forceinline__ void pack_a_m1(
-    uint32_t (&a)[4], const uint8_t* s_A, int lane_id)
+// ============================================================================
+// Swizzle<3,4,3> SMEM Layout (validated Sprint 4 Task 1)
+// ============================================================================
+__device__ __forceinline__ uint32_t swizzle_343(uint32_t byte_offset) {
+    return byte_offset ^ ((byte_offset >> 3) & 0x70u);
+}
+
+// Get FP4 nibble from swizzled SMEM
+__device__ __forceinline__ uint32_t get_nibble_swz(
+    const uint8_t* smem, int row_byte_off, int k)
+{
+    int linear_addr = row_byte_off + k / 2;
+    uint8_t byte_val = smem[swizzle_343(linear_addr)];
+    return (k & 1) ? ((byte_val >> 4) & 0xFu) : (byte_val & 0xFu);
+}
+
+// ============================================================================
+// CRITICAL DISCOVERY: MMA scale_vec::2X byte-to-register mapping
+// ============================================================================
+//
+// The mxf4nvf4 block_scale MMA with scale_vec::2X applies scales PER REGISTER
+// GROUP, NOT per contiguous K block:
+//   SFA byte 0 → scales ALL nibbles in a[0] and a[1]
+//   SFA byte 1 → scales ALL nibbles in a[2] and a[3]
+//   SFA bytes 2,3 → IGNORED
+//   (Same pattern for SFB: byte 0 → b[0], byte 1 → b[1])
+//
+// Since a[0] contains K values {t0, t0+8, t0+16, ..., t0+56} which span
+// BOTH SF_BLOCK=32 blocks, we must RESCALE nibbles during packing so that
+// each register uses a uniform scale. We pick the MAX of the two block
+// scales as the unified scale, and rescale nibbles from the smaller block.
+//
+// HARDWARE REGISTER LAYOUT (empirically determined, Sprint 4 Task 1):
+//   A: group g=tid/4: a[0]=M=2g K=t0+p*8, a[2]=M=2g K=t0+4+p*8
+//   B: group g=tid/4: N=4*(g%2)+g/2, b[0] K=t0+p*8, b[1] K=t0+4+p*8
+//   C: d[0]=C[2*g, tid%4], d[1]=C[2*g, tid%4+4]
+
+// Rescale an FP4 nibble from old_sf to new_sf (new_sf >= old_sf)
+// Uses integer bit manipulation to avoid exp2f (which causes Heisenbugs with -rdc=true -O2)
+__device__ __forceinline__ uint32_t rescale_nib(uint32_t nib, int sf_old, int sf_new) {
+    if (sf_old == sf_new) return nib;
+    int mag = nib & 7;
+    if (mag == 0) return nib;  // 0.0 stays 0.0 regardless of scale
+    int sign = (nib >> 3) & 1;
+    float val = d_e2m1_val(mag);
+    // scale ratio = 2^(sf_old - sf_new), always <= 1.0
+    // Construct the float directly via IEEE 754 bit manipulation
+    int diff = sf_new - sf_old;  // diff >= 0
+    if (diff >= 24) return (sign << 3);  // rounds to 0
+    // 2^(-diff) = IEEE float with exponent = 127 - diff
+    float scale_ratio = __int_as_float((uint32_t)(127 - diff) << 23);
+    val *= scale_ratio;
+    // Re-quantize to nearest E2M1
+    int idx;
+    if      (val < 0.25f)  idx = 0;
+    else if (val < 0.75f)  idx = 1;
+    else if (val < 1.25f)  idx = 2;
+    else if (val < 1.75f)  idx = 3;
+    else if (val < 2.5f)   idx = 4;
+    else if (val < 3.5f)   idx = 5;
+    else if (val < 5.0f)   idx = 6;
+    else                    idx = 7;
+    return (sign << 3) | idx;
+}
+
+// Pack A for M=1 decode with per-register rescaling
+// sf_a: [2] UE8M0 scale bytes for K blocks 0 and 1
+// Returns the unified scale byte (max of the two)
+__device__ __forceinline__ uint8_t pack_a_m1_rescaled(
+    uint32_t (&a)[4], const uint8_t* s_A,
+    const uint8_t* sf_a, int lane_id)
 {
     a[0] = a[1] = a[2] = a[3] = 0;
-    if (lane_id % 4 == 0) {
-        int t1 = lane_id / 4;  // 0..7
-        // Row 0 data starts at s_A[0], 32 bytes for K=0..63
-        a[0] = get_nibble(s_A, t1)
-             | (get_nibble(s_A, t1 + 16) << 4)
-             | (get_nibble(s_A, t1 + 32) << 8)
-             | (get_nibble(s_A, t1 + 48) << 12);
-        a[1] = get_nibble(s_A, t1 + 8)
-             | (get_nibble(s_A, t1 + 24) << 4)
-             | (get_nibble(s_A, t1 + 40) << 8)
-             | (get_nibble(s_A, t1 + 56) << 12);
+    uint8_t sf_max = (sf_a[0] > sf_a[1]) ? sf_a[0] : sf_a[1];
+    if (lane_id / 4 != 0) return sf_max;  // Only group 0 -> M=0
+    int t0 = lane_id % 4;
+    int sf0 = (int)sf_a[0], sf1 = (int)sf_a[1], sfm = (int)sf_max;
+    #pragma unroll
+    for (int p = 0; p < 8; p++) {
+        int k0 = t0 + p * 8;
+        int k2 = t0 + 4 + p * 8;
+        uint32_t nib0 = get_nibble_swz(s_A, 0, k0);
+        uint32_t nib2 = get_nibble_swz(s_A, 0, k2);
+        nib0 = rescale_nib(nib0, (k0 < 32) ? sf0 : sf1, sfm);
+        nib2 = rescale_nib(nib2, (k2 < 32) ? sf0 : sf1, sfm);
+        a[0] |= nib0 << (p * 4);
+        a[2] |= nib2 << (p * 4);
     }
+    return sf_max;
 }
 
-// Pack B registers for weight tile
-// s_B: [BN rows, BK/2 bytes] row-major. Each row = one N-column's K-data.
-// warp_id selects which 8 rows (N-columns) this warp processes.
-__device__ __forceinline__ void pack_b(
-    uint32_t (&b)[2], const uint8_t* s_B_warp, int lane_id)
+// Pack B with per-register rescaling
+// sf_b: pointer to 2 UE8M0 bytes for this N column's K blocks
+// Returns the unified scale byte
+__device__ __forceinline__ uint8_t pack_b_rescaled(
+    uint32_t (&b)[2], const uint8_t* s_B, int warp_n_base,
+    const uint8_t* s_SFB, int lane_id)
 {
-    int t0 = lane_id % 4;   // maps to N column 0..3 (and +4 for reg 1)
-    int t1 = lane_id / 4;   // maps to K offset 0..7
+    int g = lane_id / 4;
+    int t0 = lane_id % 4;
+    int N_local = 4 * (g & 1) + (g >> 1);
+    int row_byte_off = (warp_n_base + N_local) * (BK / 2);
 
-    const uint8_t* row_n0 = s_B_warp + t0 * (BK / 2);       // N=t0
-    const uint8_t* row_n4 = s_B_warp + (t0 + 4) * (BK / 2); // N=t0+4
+    // Get scale bytes for this N column
+    int sfb_n = warp_n_base + N_local;
+    int sf0 = (int)s_SFB[sfb_n * 2];
+    int sf1 = (int)s_SFB[sfb_n * 2 + 1];
+    int sfm = (sf0 > sf1) ? sf0 : sf1;
 
     b[0] = b[1] = 0;
     #pragma unroll
-    for (int vi = 0; vi < 8; vi++) {
-        int k = t1 + vi * 8;
-        b[0] |= get_nibble(row_n0, k) << (vi * 4);
-        b[1] |= get_nibble(row_n4, k) << (vi * 4);
+    for (int p = 0; p < 8; p++) {
+        int k0 = t0 + p * 8;
+        int k2 = t0 + 4 + p * 8;
+        uint32_t nib0 = get_nibble_swz(s_B, row_byte_off, k0);
+        uint32_t nib2 = get_nibble_swz(s_B, row_byte_off, k2);
+        nib0 = rescale_nib(nib0, (k0 < 32) ? sf0 : sf1, sfm);
+        nib2 = rescale_nib(nib2, (k2 < 32) ? sf0 : sf1, sfm);
+        b[0] |= nib0 << (p * 4);
+        b[1] |= nib2 << (p * 4);
     }
+    return (uint8_t)sfm;
 }
 
 // Block-scaled NVF4 MMA: m16n8k64, scale_vec::2X, UE8M0 scales
@@ -240,17 +313,20 @@ verdict_mma_cooperative(
             const int n_off = np * BN;
 
             // Load A: input FP4 [16, 32 bytes] — only row 0 valid (M=1)
+            // Apply Swizzle<3,4,3> on write
             for (int i = tid; i < SMEM_A; i += BLOCK_SIZE) {
                 int row = i / (BK / 2);
                 int col = i % (BK / 2);
-                s_A[i] = (row == 0) ? input_fp4[k_start_pk + col] : 0;
+                uint8_t val = (row == 0) ? input_fp4[k_start_pk + col] : 0;
+                s_A[swizzle_343(i)] = val;
             }
 
             // Load B: weight FP4 [64, 32 bytes]
+            // Apply Swizzle<3,4,3> on write
             for (int i = tid; i < SMEM_B; i += BLOCK_SIZE) {
                 int row = i / (BK / 2);
                 int col = i % (BK / 2);
-                s_B[i] = w1_fp4[(long long)(n_off + row) * K_PACKED + k_start_pk + col];
+                s_B[swizzle_343(i)] = w1_fp4[(long long)(n_off + row) * K_PACKED + k_start_pk + col];
             }
 
             // Load SFA: 2 UE8M0 scale bytes for K-tile
@@ -266,36 +342,97 @@ verdict_mma_cooperative(
 
             __syncthreads();
 
-            // MMA: each warp handles 8 output columns
+            // === RESCALE SMEM DATA IN-PLACE ===
+            // Compute unified scale (max of 2 block scales) for A and B
+            uint8_t sfa_max = (s_SFA[0] > s_SFA[1]) ? s_SFA[0] : s_SFA[1];
+
+            // Rescale A row 0 in SMEM (32 bytes = 64 nibbles)
+            if (s_SFA[0] != s_SFA[1]) {
+                for (int i = tid; i < 32; i += BLOCK_SIZE) {
+                    int swz_i = swizzle_343(i);
+                    uint8_t byte_val = s_A[swz_i];
+                    int k_lo = i * 2, k_hi = k_lo + 1;
+                    uint8_t nib_lo = byte_val & 0xF;
+                    uint8_t nib_hi = (byte_val >> 4) & 0xF;
+                    int sf_lo = (k_lo < 32) ? (int)s_SFA[0] : (int)s_SFA[1];
+                    int sf_hi = (k_hi < 32) ? (int)s_SFA[0] : (int)s_SFA[1];
+                    nib_lo = (uint8_t)rescale_nib(nib_lo, sf_lo, (int)sfa_max);
+                    nib_hi = (uint8_t)rescale_nib(nib_hi, sf_hi, (int)sfa_max);
+                    s_A[swz_i] = (nib_hi << 4) | nib_lo;
+                }
+            }
+
+            // Rescale B rows in SMEM (2048 bytes = 64 rows x 32 bytes)
+            for (int i = tid; i < SMEM_B; i += BLOCK_SIZE) {
+                int row = i / (BK / 2);   // N column (0..63)
+                int col = i % (BK / 2);   // packed K byte
+                int sfb_row = row;
+                uint8_t sf0 = s_SFB[sfb_row * 2];
+                uint8_t sf1 = s_SFB[sfb_row * 2 + 1];
+                if (sf0 == sf1) continue;
+                uint8_t sfm = (sf0 > sf1) ? sf0 : sf1;
+                int swz_i = swizzle_343(i);
+                uint8_t byte_val = s_B[swz_i];
+                int k_lo = col * 2, k_hi = k_lo + 1;
+                uint8_t nib_lo = byte_val & 0xF;
+                uint8_t nib_hi = (byte_val >> 4) & 0xF;
+                int sf_lo_v = (k_lo < 32) ? (int)sf0 : (int)sf1;
+                int sf_hi_v = (k_hi < 32) ? (int)sf0 : (int)sf1;
+                nib_lo = (uint8_t)rescale_nib(nib_lo, sf_lo_v, (int)sfm);
+                nib_hi = (uint8_t)rescale_nib(nib_hi, sf_hi_v, (int)sfm);
+                s_B[swz_i] = (nib_hi << 4) | nib_lo;
+            }
+
+            __syncthreads();
+
+            // MMA: simple packing (data already rescaled in SMEM)
             {
+                // Pack A (simple, no rescaling needed)
                 uint32_t a_regs[4];
-                pack_a_m1(a_regs, s_A, lane_id);
+                a_regs[0] = a_regs[1] = a_regs[2] = a_regs[3] = 0;
+                if (lane_id / 4 == 0) {
+                    int t0 = lane_id % 4;
+                    #pragma unroll
+                    for (int p = 0; p < 8; p++) {
+                        a_regs[0] |= get_nibble_swz(s_A, 0, t0 + p*8) << (p*4);
+                        a_regs[2] |= get_nibble_swz(s_A, 0, t0 + 4 + p*8) << (p*4);
+                    }
+                }
 
+                // Pack B (simple, no rescaling needed)
                 uint32_t b_regs[2];
-                int b_base = warp_id * MMA_N * (BK / 2);
-                pack_b(b_regs, s_B + b_base, lane_id);
+                {
+                    int g = lane_id / 4;
+                    int t0 = lane_id % 4;
+                    int N_local = 4*(g&1) + (g>>1);
+                    int rbo = (warp_id*8 + N_local) * (BK/2);
+                    b_regs[0] = b_regs[1] = 0;
+                    #pragma unroll
+                    for (int p = 0; p < 8; p++) {
+                        b_regs[0] |= get_nibble_swz(s_B, rbo, t0+p*8) << (p*4);
+                        b_regs[1] |= get_nibble_swz(s_B, rbo, t0+4+p*8) << (p*4);
+                    }
+                }
 
-                // SFA: same for all threads (input K-block scales)
-                uint16_t sfa_pk = (uint16_t)s_SFA[0] |
-                                  ((uint16_t)s_SFA[1] << 8);
-
-                // SFB: MMA applies same scale to all N cols within tile
-                // Use first column's scales as representative
-                int g_sf_n   = warp_id * 8;  // first N-col in this warp
-                int sfb_idx  = g_sf_n * (BK / SF_BLOCK);
-                uint16_t sfb_pk = (uint16_t)s_SFB[sfb_idx] |
-                                  ((uint16_t)s_SFB[sfb_idx + 1] << 8);
+                // Unified scales (same byte in both positions)
+                uint32_t sfa_pk = (uint32_t)sfa_max | ((uint32_t)sfa_max << 8);
+                int g = lane_id / 4;
+                int N_local = 4*(g&1) + (g>>1);
+                int sfb_n = warp_id*8 + N_local;
+                uint8_t sfbm = (s_SFB[sfb_n*2] > s_SFB[sfb_n*2+1]) ?
+                               s_SFB[sfb_n*2] : s_SFB[sfb_n*2+1];
+                uint32_t sfb_pk = (uint32_t)sfbm | ((uint32_t)sfbm << 8);
 
                 float acc[4] = {0, 0, 0, 0};
                 mma_nvf4_m16n8k64(acc, a_regs, b_regs, acc,
-                                  (uint32_t)sfa_pk, (uint32_t)sfb_pk);
+                                  sfa_pk, sfb_pk);
 
-                // CLayout: t%4==0 threads hold M=0 result in d[0], N=t/4
-                if (lane_id % 4 == 0) {
-                    int n_col = lane_id / 4;  // 0..7
+                // C output: d[0]=C[0, lane_id], d[1]=C[0, lane_id+4]
+                if (lane_id < 4) {
                     long long pb = (long long)eidx * TILES * N2 +
                                    (long long)tile * N2;
-                    partials[pb + n_off + warp_id * 8 + n_col] = acc[0];
+                    partials[pb + n_off + warp_id * 8 + lane_id]     = acc[0];
+                    partials[pb + n_off + warp_id * 8 + lane_id + 4] = acc[1];
                 }
             }
             __syncthreads();
@@ -387,21 +524,25 @@ verdict_mma_cooperative(
             const int k_off_sf = k_off / SF_BLOCK;
 
             // Load A: intermediate FP4 [16, 32 bytes] — row 0 only
+            // Apply Swizzle<3,4,3> on write
             for (int i = tid; i < SMEM_A; i += BLOCK_SIZE) {
                 int row = i / (BK / 2);
                 int col = i % (BK / 2);
-                s_A[i] = (row == 0) ?
+                uint8_t val = (row == 0) ?
                     gmem_inter_fp4[eidx * N_HALF_PACKED + k_off_pk + col] : 0;
+                s_A[swizzle_343(i)] = val;
             }
 
             // Load B: W2 weight FP4 [64, 32 bytes]
             // W2 layout: [HIDDEN, N_HALF/2], row = output col, col = packed intermediate
+            // Apply Swizzle<3,4,3> on write
             for (int i = tid; i < SMEM_B; i += BLOCK_SIZE) {
                 int row = i / (BK / 2);
                 int col = i % (BK / 2);
                 int out_col = j_start + row;
-                s_B[i] = (out_col < HIDDEN) ?
+                uint8_t val = (out_col < HIDDEN) ?
                     w2_fp4[(long long)out_col * N_HALF_PACKED + k_off_pk + col] : 0;
+                s_B[swizzle_343(i)] = val;
             }
 
             // Load SFA: intermediate scales
@@ -419,36 +560,78 @@ verdict_mma_cooperative(
 
             __syncthreads();
 
-            // MMA
+            // Rescale SMEM data in-place + simple MMA
             {
-                uint32_t a_regs[4];
-                pack_a_m1(a_regs, s_A, lane_id);
+                uint8_t sfa_max2 = (s_SFA[0] > s_SFA[1]) ? s_SFA[0] : s_SFA[1];
+                // Rescale A row 0
+                if (s_SFA[0] != s_SFA[1]) {
+                    for (int i = tid; i < 32; i += BLOCK_SIZE) {
+                        int swz_i = swizzle_343(i);
+                        uint8_t bv = s_A[swz_i];
+                        int k_lo = i*2, k_hi = k_lo+1;
+                        uint8_t nl = bv & 0xF, nh = (bv>>4) & 0xF;
+                        nl = (uint8_t)rescale_nib(nl, (k_lo<32)?(int)s_SFA[0]:(int)s_SFA[1], (int)sfa_max2);
+                        nh = (uint8_t)rescale_nib(nh, (k_hi<32)?(int)s_SFA[0]:(int)s_SFA[1], (int)sfa_max2);
+                        s_A[swz_i] = (nh<<4)|nl;
+                    }
+                }
+                // Rescale B rows
+                for (int i = tid; i < SMEM_B; i += BLOCK_SIZE) {
+                    int row = i/(BK/2), col = i%(BK/2);
+                    uint8_t sf0 = s_SFB[row*2], sf1 = s_SFB[row*2+1];
+                    if (sf0 == sf1) continue;
+                    uint8_t sfm = (sf0>sf1)?sf0:sf1;
+                    int swz_i = swizzle_343(i);
+                    uint8_t bv = s_B[swz_i];
+                    int k_lo = col*2, k_hi = k_lo+1;
+                    uint8_t nl = bv&0xF, nh = (bv>>4)&0xF;
+                    nl = (uint8_t)rescale_nib(nl, (k_lo<32)?(int)sf0:(int)sf1, (int)sfm);
+                    nh = (uint8_t)rescale_nib(nh, (k_hi<32)?(int)sf0:(int)sf1, (int)sfm);
+                    s_B[swz_i] = (nh<<4)|nl;
+                }
+                __syncthreads();
 
-                uint32_t b_regs[2];
-                int b_base = warp_id * MMA_N * (BK / 2);
-                pack_b(b_regs, s_B + b_base, lane_id);
+                // Simple packing (data already rescaled)
+                uint32_t a_regs[4] = {0,0,0,0};
+                if (lane_id/4 == 0) {
+                    int t0 = lane_id%4;
+                    for (int p=0;p<8;p++) {
+                        a_regs[0] |= get_nibble_swz(s_A,0,t0+p*8)<<(p*4);
+                        a_regs[2] |= get_nibble_swz(s_A,0,t0+4+p*8)<<(p*4);
+                    }
+                }
+                uint32_t b_regs[2] = {0,0};
+                {
+                    int g=lane_id/4, t0=lane_id%4;
+                    int N_loc = 4*(g&1)+(g>>1);
+                    int rbo = (warp_id*8+N_loc)*(BK/2);
+                    for (int p=0;p<8;p++) {
+                        b_regs[0] |= get_nibble_swz(s_B,rbo,t0+p*8)<<(p*4);
+                        b_regs[1] |= get_nibble_swz(s_B,rbo,t0+4+p*8)<<(p*4);
+                    }
+                }
 
-                uint16_t sfa_pk = (uint16_t)s_SFA[0] |
-                                  ((uint16_t)s_SFA[1] << 8);
+                uint32_t sfa_pk2 = (uint32_t)sfa_max2 | ((uint32_t)sfa_max2<<8);
+                int g2=lane_id/4, N_loc2=4*(g2&1)+(g2>>1);
+                int sfb_n2 = warp_id*8+N_loc2;
+                uint8_t sfbm2 = (s_SFB[sfb_n2*2]>s_SFB[sfb_n2*2+1]) ?
+                                s_SFB[sfb_n2*2]:s_SFB[sfb_n2*2+1];
+                uint32_t sfb_pk2 = (uint32_t)sfbm2 | ((uint32_t)sfbm2<<8);
 
-                // SFB: uniform across N cols in tile
-                int g_sf_n  = warp_id * 8;
-                int sfb_idx = g_sf_n * (BK / SF_BLOCK);
-                uint16_t sfb_pk = (uint16_t)s_SFB[sfb_idx] |
-                                  ((uint16_t)s_SFB[sfb_idx + 1] << 8);
-
-                mma_nvf4_m16n8k64(acc, a_regs, b_regs, acc,
-                                  (uint32_t)sfa_pk, (uint32_t)sfb_pk);
+                mma_nvf4_m16n8k64(acc, a_regs, b_regs, acc, sfa_pk2, sfb_pk2);
             }
             __syncthreads();
         }
 
-        // CLayout: t%4==0 threads hold M=0 in d[0], N=t/4
-        if (lane_id % 4 == 0) {
-            int n_col = lane_id / 4;
-            int out_j = j_start + warp_id * 8 + n_col;
-            if (out_j < HIDDEN)
-                atomicAdd(&output[out_j], wt * acc[0]);
+        // C output: d[0]=C[0, lane_id], d[1]=C[0, lane_id+4]
+        // Only group 0 (lanes 0-3) has M=0 results
+        if (lane_id < 4) {
+            int out_j0 = j_start + warp_id * 8 + lane_id;
+            int out_j1 = j_start + warp_id * 8 + lane_id + 4;
+            if (out_j0 < HIDDEN)
+                atomicAdd(&output[out_j0], wt * acc[0]);
+            if (out_j1 < HIDDEN)
+                atomicAdd(&output[out_j1], wt * acc[1]);
         }
     }
 }
@@ -879,7 +1062,7 @@ int main()
 
         float ms;
         cudaEventElapsedTime(&ms, start, stop);
-        times.push_back(ms * 1000.0f);  // μs
+        times.push_back(ms * 1000.0f);  // us
 
         cudaEventDestroy(start);
         cudaEventDestroy(stop);
@@ -891,10 +1074,10 @@ int main()
     float p90    = times[ITERS * 9 / 10];
     float mean   = std::accumulate(times.begin(), times.end(), 0.0f) / ITERS;
 
-    printf("Latency (μs/layer): median=%.1f, mean=%.1f, p10=%.1f, p90=%.1f\n",
+    printf("Latency (us/layer): median=%.1f, mean=%.1f, p10=%.1f, p90=%.1f\n",
            median, mean, p10, p90);
-    printf("Comparison: Scalar=~280μs, VLLM_CUTLASS=98μs, "
-           "Cooperative FP32=38.9μs\n");
+    printf("Comparison: Scalar=~280us, VLLM_CUTLASS=98us, "
+           "Cooperative FP32=38.9us\n");
 
     // ====== Cleanup ======
     delete[] h_input; delete[] h_w1; delete[] h_w2;
