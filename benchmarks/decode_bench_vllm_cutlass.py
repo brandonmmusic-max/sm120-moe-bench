@@ -47,13 +47,18 @@ def main():
         print(f"  {i+1:2d} |   {tps:.1f}")
 
     avg = sum(tps_list) / len(tps_list)
-    med = sorted(tps_list)[len(tps_list)//2]
+    sorted_tps = sorted(tps_list)
+    med = sorted_tps[len(sorted_tps)//2]
+    mn = sorted_tps[0]
+    mx = sorted_tps[-1]
     print("-" * 20)
     print(f" Avg |   {avg:.1f}")
     print(f" Med |   {med:.1f}")
-    print(f"\nBackend: VLLM_CUTLASS (VLLM_USE_FLASHINFER_MOE_FP4=0)")
-    print(f"Prior FlashInfer baseline: 127-142 tok/s")
-    print(f"Speedup vs FlashInfer: {avg/127:.2f}x (vs 127) / {avg/142:.2f}x (vs 142)")
+    print(f" Min |   {mn:.1f}")
+    print(f" Max |   {mx:.1f}")
+    print(f"\nBackend: VERDICT_MOE (VLLM_USE_VERDICT_MOE=1)")
+    print(f"Prior VLLM_CUTLASS EP=4 MTP=3 baseline: ~129 tok/s median")
+    print(f"Speedup vs VLLM_CUTLASS: {med/129:.2f}x (median)")
 
 if __name__ == "__main__":
     main()
