@@ -286,8 +286,9 @@ class VerdictMoEExperts(mk.FusedMoEExpertsModular):
         e, m, n, k, topk_val = self.moe_problem_size(
             hidden_states, w1, w2, topk_ids
         )
-        n = w2.size(2) * 2  # N_half * 2 = N
-        N_half = n // 2
+        # w2 is [E, K, N_packed] where N_packed = intermediate_size / 2 (FP4 packed)
+        # N_half = intermediate_size (each of gate/up output dimension)
+        N_half = w2.size(2) * 2
         num_topk = topk_ids.size(1)
         num_active = m * num_topk
         device = hidden_states.device

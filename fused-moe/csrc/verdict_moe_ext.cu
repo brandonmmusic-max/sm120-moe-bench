@@ -91,10 +91,11 @@ __device__ __forceinline__ float decode_e4m3fn(uint8_t x) {
     if (e == 15 && m == 7) {
         val = 0.0f;  // NaN → 0
     } else if (e == 0) {
-        val = __int2float_rn(m) * 0.001953125f;  // m/8 * 2^(-6) = m * (1/512)
+        val = __int2float_rn(m) * 0.001953125f;  // m * 2^(-9) = m/512
     } else {
-        val = (1.0f + __int2float_rn(m) * 0.125f) * __int2float_rn(1 << (e + 17));
-        val *= 5.960464477539063e-08f;  // 2^(-24) to adjust: 2^(e-7) = 2^(e+17) * 2^(-24)
+        // Use ldexpf to avoid integer overflow for e>=14
+        // (1 + m/8) * 2^(e-7) — correct for all valid exponents
+        val = ldexpf(1.0f + __int2float_rn(m) * 0.125f, e - 7);
     }
     return s ? -val : val;
 }
@@ -199,14 +200,18 @@ __global__ void verdict_gemm1_distributed(
     __syncthreads();
 
     // 4. Compute partial gate/up from SMEM (no GMEM access in inner loop)
-    if (tid < N_half) {
+    // Loop to handle N_half > BLOCK_SIZE (e.g., N_half=1024 with 256 threads)
+    long long part_base = (long long)eidx * tiles_per_expert * 2 * N_half
+                        + (long long)tile * 2 * N_half;
+
+    for (int row = tid; row < N_half; row += BLOCK_SIZE) {
         float gate_p = 0.0f, up_p = 0.0f;
 
         // Precompute row offsets in SMEM
-        int gate_fp4_base = tid * k_per_packed;
-        int gate_sf_base = tid * k_per_sf;
-        int up_fp4_base = (tid + N_half) * k_per_packed;
-        int up_sf_base = (tid + N_half) * k_per_sf;
+        int gate_fp4_base = row * k_per_packed;
+        int gate_sf_base = row * k_per_sf;
+        int up_fp4_base = (row + N_half) * k_per_packed;
+        int up_sf_base = (row + N_half) * k_per_sf;
 
         for (int ki = 0; ki < k_per; ki++) {
             float inp_k = s_input[ki];
@@ -230,10 +235,8 @@ __global__ void verdict_gemm1_distributed(
         gate_p *= alpha;
         up_p *= alpha;
 
-        long long part_base = (long long)eidx * tiles_per_expert * 2 * N_half
-                            + (long long)tile * 2 * N_half;
-        partials[part_base + tid] = gate_p;
-        partials[part_base + N_half + tid] = up_p;
+        partials[part_base + row] = gate_p;
+        partials[part_base + N_half + row] = up_p;
     }
 }
 
@@ -249,20 +252,23 @@ __global__ void verdict_swiglu_reduce(
 {
     const int eidx = blockIdx.x;
     const int tid = threadIdx.x;
-    if (eidx >= num_active || tid >= N_half) return;
+    if (eidx >= num_active) return;
 
     long long part_base = (long long)eidx * tiles_per_expert * 2 * N_half;
 
-    float gate_sum = 0.0f, up_sum = 0.0f;
-    for (int t = 0; t < tiles_per_expert; t++) {
-        gate_sum += partials[part_base + (long long)t * 2 * N_half + tid];
-        up_sum   += partials[part_base + (long long)t * 2 * N_half + N_half + tid];
-    }
+    // Loop to handle N_half > BLOCK_SIZE
+    for (int col = tid; col < N_half; col += BLOCK_SIZE) {
+        float gate_sum = 0.0f, up_sum = 0.0f;
+        for (int t = 0; t < tiles_per_expert; t++) {
+            gate_sum += partials[part_base + (long long)t * 2 * N_half + col];
+            up_sum   += partials[part_base + (long long)t * 2 * N_half + N_half + col];
+        }
 
-    float sw = up_sum * d_silu(gate_sum);
-    // E4M3 requant (lossy but matches validated pipeline)
-    uint8_t e4m3 = float_to_e4m3(sw);
-    gmem_inter[eidx * N_half + tid] = decode_e4m3fn(e4m3);
+        float sw = up_sum * d_silu(gate_sum);
+        // E4M3 requant (lossy but matches validated pipeline)
+        uint8_t e4m3 = float_to_e4m3(sw);
+        gmem_inter[eidx * N_half + col] = decode_e4m3fn(e4m3);
+    }
 }
 
 // ============================================================================
@@ -377,6 +383,13 @@ void verdict_fused_moe_forward(
 
     auto stream = at::cuda::getCurrentCUDAStream();
 
+    // Raise dynamic SMEM limit for GEMM1 (may exceed default 48KB with large N_half)
+    if (smem_k1 > 48 * 1024) {
+        cudaFuncSetAttribute(verdict_gemm1_distributed,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             smem_k1);
+    }
+
     // Zero output scratch
     cudaMemsetAsync(output_f32.data_ptr(), 0, output_f32.numel() * sizeof(float), stream);
 
@@ -483,6 +496,13 @@ std::vector<float> verdict_per_kernel_timing(
     int smem_k1 = k_per * (int)sizeof(float) + N2 * (k_per / 2) + N2 * (k_per / FP4_BLOCK_SIZE);
     int smem_k3 = N_half * (int)sizeof(float);
     auto stream = at::cuda::getCurrentCUDAStream();
+
+    // Raise dynamic SMEM limit for GEMM1 if needed
+    if (smem_k1 > 48 * 1024) {
+        cudaFuncSetAttribute(verdict_gemm1_distributed,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             smem_k1);
+    }
 
     // Warmup
     for (int i = 0; i < 20; i++) {
