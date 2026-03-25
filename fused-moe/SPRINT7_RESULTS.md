@@ -35,6 +35,103 @@ architecture as Sprint 6. No cooperative_groups, no -rdc=true.
 
 ---
 
+## Consolidated Results
+
+### Standalone Kernel μs/layer (All Configs)
+
+| Config | M | N_HALF | K_GROUPS | μs/layer | vs CUTLASS |
+|--------|---|--------|----------|----------|------------|
+| **TP=4** | 1 | 256 | 16 | **19.8** | **4.95x** |
+| **TP=4** | 4 | 256 | 16 | **26.0** | **~3.8x** |
+| EP=4 | 1 | 1024 | 4 | 54.7 | 1.79x |
+| EP=4 | 4 | 1024 | 4 | 63.2 | 1.90x |
+| CUTLASS | 1 | — | — | 98.0 | 1.00x |
+| CUTLASS | 4 | — | — | ~120 | 1.00x |
+
+### vLLM End-to-End tok/s (All 4 Backends, 25 runs, 512 tokens, MTP=3)
+
+| Backend | Avg tok/s | Median tok/s | Min | Max | vs Production |
+|---------|----------|-------------|-----|-----|--------------|
+| **VerdictMoE TP=4** | **170.2** | **161.6** | 106.6 | **232.5** | **1.32x** |
+| VerdictMoE EP=4 | 133.5 | 121.8 | 100.4 | 181.6 | 1.03x |
+| VLLM_CUTLASS TP=4 | 125.8 | 126.4 | 105.1 | 152.9 | 0.98x |
+| FLASHINFER_CUTLASS TP=4 (prod) | 129.0 | 131.2 | 101.8 | 149.5 | 1.00x |
+
+### Correctness Summary
+
+| Test | Result |
+|------|--------|
+| Standalone kernel vs QRef (M=1 EP=4) | 9.59% agg error — PASS |
+| Standalone kernel vs QRef (M=4 EP=4) | 9.36% agg error — PASS |
+| Standalone kernel vs QRef (M=1 TP=4) | 10.27% agg error — PASS |
+| Standalone kernel vs QRef (M=4 TP=4) | 9.77% agg error — PASS |
+| Perplexity (log-prob delta vs CUTLASS) | 0.47% — PASS (<1%) |
+| Text generation (temp=0, coherence) | All prompts PASS |
+| CUDA graphs | 51 captured, no deadlocks |
+| Repetition check (500 tok essay) | 1.00 unique 4-gram ratio |
+
+---
+
+## Technical Discoveries
+
+### 1. Consecutive-K Packing (Sprint 5, validated Sprint 7)
+
+The `scale_vec::4X` MMA on SM120 applies scale bytes per register pair — byte 0→a[0],
+byte 2→a[2]. With strided K packing (interleaved across SF blocks), each register spans
+multiple scale blocks, requiring expensive rescaling in the inner loop.
+
+**Discovery:** The dot product is K-permutation invariant. Packing K positions
+consecutively (`t0*8+p` instead of `t0+p*8`) groups all K positions within each register
+to a single SF_BLOCK=16 block. Scale bytes align perfectly with MMA hardware scaling.
+
+**Impact:** Zero rescaling in the inner loop. Validated bit-exact (0.0000% error with
+`consec_k_probe2.cu`). Strided packing gives 7.14% error with identical data.
+
+### 2. scale_vec::4X Per-Lane Semantics
+
+CRITICAL finding: `scale_vec::4X` applies SFA/SFB bytes **per lane pair**, not per block.
+Each 32-bit scale word contains 4 E4M3FN bytes, each applied to a specific register
+position within the MMA instruction. This is undocumented — discovered empirically.
+
+**Impact:** Native E4M3FN checkpoint scales load directly into SFA/SFB with zero
+conversion. No `ldexpf()`, no `unify_scales()`, no rescaling functions anywhere in
+the kernel. Combined with consecutive-K packing, this eliminates ALL scale manipulation.
+
+### 3. Fast uint32 SMEM Packing (Sprint 6)
+
+With consecutive-K layout, 4 consecutive bytes in SMEM contain 8 FP4 nibbles in exact
+MMA register layout. A single `*(uint32_t*)&s_B[addr]` replaces 16 scalar nibble reads +
+16 shift-OR operations.
+
+**Impact:** 116.1 → 87.5 μs (24.6% speedup). Packing was the bottleneck, not HBM
+bandwidth. The 640-CTA K-distributed approach with fast packing beats CUTLASS 1.12x.
+
+### 4. Shared Routing + MTP Interaction (Sprint 7)
+
+With M≤4 shared routing, all speculative tokens use the first token's expert set.
+When MTP speculative tokens happen to route to the same experts → accepted → high
+throughput (200-232 tok/s). When routing differs → rejected → falls back to 1 token/step.
+
+**Diagnosis:** MTP acceptance rate with shared routing is ~61.4% (vs ~75% with per-token
+routing). This creates a bimodal throughput distribution. The kernel is 1.90x faster, but
+the MTP penalty partially offsets the gain — especially at EP=4 where MoE is only 12% of
+decode time.
+
+**Fix (future):** Expert union routing — take union of M tokens' expert sets, zero-weight
+non-routed experts. Preserves per-token correctness while amortizing weight loads.
+
+### 5. TP=4 vs EP=4 Kernel ROI
+
+With EP=4, each GPU processes ~2.5 local experts (10 routed ÷ 4 GPUs). MoE is only ~12%
+of decode time. Even a perfect (0μs) kernel saves at most 12%.
+
+With TP=4, all 10 experts are local but weights are sharded 4-way (N_HALF=256). MoE is
+~22% of decode time. The 4.95x kernel speedup translates to ~16% end-to-end savings.
+
+**Impact:** TP=4 delivers 1.83x more kernel optimization headroom than EP=4.
+
+---
+
 ## Cross-Sprint Comparison
 
 | Sprint | Kernel μs (M=1) | Kernel vs CUTLASS | E2E tok/s (best config) | E2E vs CUTLASS | Key Technique |

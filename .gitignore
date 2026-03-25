@@ -1,0 +1,15 @@
+# Compiled binaries
+fused-moe/csrc/verdict_fused_cooperative_mt
+fused-moe/csrc/verdict_*_test
+*.o
+*.so
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# Build
+build/
+dist/
