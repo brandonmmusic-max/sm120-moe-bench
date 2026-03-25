@@ -41,7 +41,7 @@ constexpr int SF_PER_TILE_WT  = BK / SF_BLOCK_WT;   // 4 scales per K=64 tile
 constexpr int SMEM_A = BM * (BK / 2);      // 512 bytes
 constexpr int SMEM_B = BN * (BK / 2);      // 2048 bytes
 
-// Total SMEM: A + B + SFA(16) + SFB_raw(256) + SFB_ratio(1024) + SFB_ue8m0(64) + pad
+// Total SMEM: A + B + SFA(16) + SFB_raw(256) + SFB_ratio(1024) + SFB_ue8m0(128) + pad
 constexpr int SMEM_MMA = 4096;
 
 // ============================================================================
@@ -152,23 +152,39 @@ __device__ __forceinline__ void mma_nvf4_m16n8k64(
 __device__ __forceinline__ void precompute_sfb(
     const uint8_t* s_SFB_raw,   // [BN * SF_PER_TILE_WT] E4M3FN bytes
     float*         s_SFB_ratio,  // [BN * SF_PER_TILE_WT] output ratios
-    uint8_t*       s_SFB_ue8m0,  // [BN] unified UE8M0 per row
+    uint8_t*       s_SFB_ue8m0,  // [BN * 2] unified UE8M0 per row per K-half
     int tid)
 {
+    // Compute 2 UE8M0 values per row (one per K-half), matching scale_vec::2X.
+    // K-half 0: scale groups 0,1 (K=0..31)
+    // K-half 1: scale groups 2,3 (K=32..63)
     if (tid < BN) {
-        float sf[SF_PER_TILE_WT], smax = 0.0f;
-        for (int j = 0; j < SF_PER_TILE_WT; j++) {
-            sf[j] = decode_e4m3fn_u(s_SFB_raw[tid * SF_PER_TILE_WT + j]);
-            smax = fmaxf(smax, sf[j]);
-        }
-        // Convert max to UE8M0
-        float sf_norm = fmaxf(smax / 6.0f, 1e-30f);
-        int ue = 127 + (int)ceilf(log2f(sf_norm));
-        ue = max(1, min(254, ue));
-        float unified = exp2f((float)(ue - 127));
-        s_SFB_ue8m0[tid] = (uint8_t)ue;
+        float sf[SF_PER_TILE_WT];
         for (int j = 0; j < SF_PER_TILE_WT; j++)
-            s_SFB_ratio[tid * SF_PER_TILE_WT + j] = sf[j] / unified;
+            sf[j] = decode_e4m3fn_u(s_SFB_raw[tid * SF_PER_TILE_WT + j]);
+
+        // K-half 0: merge groups 0,1
+        float smax0 = fmaxf(sf[0], sf[1]);
+        float sf_norm0 = fmaxf(smax0, 1e-30f);
+        int ue0 = 127 + (int)ceilf(log2f(sf_norm0));
+        ue0 = max(1, min(254, ue0));
+        float unified0 = exp2f((float)(ue0 - 127));
+
+        // K-half 1: merge groups 2,3
+        float smax1 = fmaxf(sf[2], sf[3]);
+        float sf_norm1 = fmaxf(smax1, 1e-30f);
+        int ue1 = 127 + (int)ceilf(log2f(sf_norm1));
+        ue1 = max(1, min(254, ue1));
+        float unified1 = exp2f((float)(ue1 - 127));
+
+        s_SFB_ue8m0[tid * 2]     = (uint8_t)ue0;
+        s_SFB_ue8m0[tid * 2 + 1] = (uint8_t)ue1;
+
+        // Ratios: each group divided by its K-half's unified scale
+        s_SFB_ratio[tid * SF_PER_TILE_WT + 0] = sf[0] / unified0;
+        s_SFB_ratio[tid * SF_PER_TILE_WT + 1] = sf[1] / unified0;
+        s_SFB_ratio[tid * SF_PER_TILE_WT + 2] = sf[2] / unified1;
+        s_SFB_ratio[tid * SF_PER_TILE_WT + 3] = sf[3] / unified1;
     }
 }
 
@@ -256,12 +272,14 @@ __device__ __forceinline__ void do_mma_pass(
         }
     }
 
-    // Unified scales
+    // Per-K-half scales: scale_vec::2X packs byte0=K_half0, byte1=K_half1
     uint32_t sfa_pk = (uint32_t)sfa_ue8m0 | ((uint32_t)sfa_ue8m0 << 8);
     int g = lane_id / 4;
     int N_local = 4 * (g & 1) + (g >> 1);
-    uint8_t sfb_u = s_SFB_ue8m0[warp_id * 8 + N_local];
-    uint32_t sfb_pk = (uint32_t)sfb_u | ((uint32_t)sfb_u << 8);
+    int sfb_row = warp_id * 8 + N_local;
+    uint8_t sfb_lo = s_SFB_ue8m0[sfb_row * 2];      // K-half 0
+    uint8_t sfb_hi = s_SFB_ue8m0[sfb_row * 2 + 1];  // K-half 1
+    uint32_t sfb_pk = (uint32_t)sfb_lo | ((uint32_t)sfb_hi << 8);
 
     float c_in[4] = {0, 0, 0, 0};
     if (accumulate) { c_in[0] = out0; c_in[1] = out1; }
@@ -401,16 +419,50 @@ verdict_gemm1_mma(
         precompute_sfb(s_SFB_raw, s_SFB_ratio, s_SFB_ue8m0, tid);
         __syncthreads();
 
-        // Rescale A in SMEM
-        uint8_t sfa_ue8m0 = rescale_A_smem(s_A, s_SFA, tid);
-        // Rescale B in SMEM
-        rescale_B_smem(s_B, s_SFB_ratio, tid);
+        // DISABLED rescaling for debugging — use raw FP4 data + computed scales
+        // uint8_t sfa_ue8m0 = rescale_A_smem(s_A, s_SFA, tid);
+        // rescale_B_smem(s_B, s_SFB_ratio, tid);
+        uint8_t sfa_ue8m0 = (s_SFA[0] > s_SFA[1]) ? s_SFA[0] : s_SFA[1];
         __syncthreads();
 
         // MMA + write partials
         float out0 = 0.0f, out1 = 0.0f;
-        do_mma_pass(s_A, s_B, sfa_ue8m0, s_SFB_ue8m0,
-                    warp_id, lane_id, out0, out1, false);
+
+        // BYPASS: skip rescaling, use fixed scale 127 (1.0) for debugging
+        // do_mma_pass(s_A, s_B, sfa_ue8m0, s_SFB_ue8m0,
+        //             warp_id, lane_id, out0, out1, false);
+        {
+            // Pack A
+            uint32_t a_regs[4] = {0, 0, 0, 0};
+            int g = lane_id / 4;
+            int t0 = lane_id % 4;
+            if (g == 0) {
+                #pragma unroll
+                for (int p = 0; p < 8; p++) {
+                    a_regs[0] |= get_nibble_swz(s_A, 0, t0 + p*8) << (p*4);
+                    a_regs[2] |= get_nibble_swz(s_A, 0, t0+4 + p*8) << (p*4);
+                }
+            }
+            // Pack B
+            uint32_t b_regs[2] = {0, 0};
+            {
+                int N_local = 4*(g&1) + (g>>1);
+                int rbo = (warp_id*8 + N_local) * (BK/2);
+                #pragma unroll
+                for (int p = 0; p < 8; p++) {
+                    b_regs[0] |= get_nibble_swz(s_B, rbo, t0+p*8) << (p*4);
+                    b_regs[1] |= get_nibble_swz(s_B, rbo, t0+4+p*8) << (p*4);
+                }
+            }
+            // DEBUG: use fixed scale 127 (=1.0) for both A and B
+            uint32_t sfa_pk = 127u | (127u << 8);
+            uint32_t sfb_pk = 127u | (127u << 8);
+            float c_zero[4] = {0,0,0,0};
+            float acc[4];
+            mma_nvf4_m16n8k64(acc, a_regs, b_regs, c_zero, sfa_pk, sfb_pk);
+            out0 = acc[0];
+            out1 = acc[1];
+        }
 
         if (lane_id < 4) {
             long long pb = (long long)eidx * tiles_per_expert * N2

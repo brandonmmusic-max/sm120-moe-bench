@@ -8,11 +8,14 @@ GEMM1->activation->GEMM2.
 
 Two backend paths:
   - Scalar GEMV (default): verdict_moe_ext.cu — 4-kernel pipeline
-  - MMA tensor core:       verdict_mma_ext.cu — 5-kernel pipeline with
-    NVF4 MMA m16n8k64, Swizzle<3,4,3>, per-register rescaling
+  - Single fused cooperative MMA: verdict_fused_cooperative_ext.cu — ONE kernel
+    launch per token. BF16→FP4→GEMM1→SwiGLU→E4M3 requant→GEMM2→BF16 all inside.
+    Hybrid K×N distribution (640 CTAs), consecutive-K packing, scale_vec::4X,
+    native E4M3FN scales, atomic barriers. CUDA-graph safe.
     Enabled via: VLLM_VERDICT_MMA=1
 
-Grid: num_active_experts x 64 N-tiles = 640 CTAs across 188 SMs.
+Grid: topk (10) × NUM_TILES (64) = 640 CTAs per token ≤ 752 max concurrent.
+For MTP=3 (M=4): loops over tokens in C++, one kernel launch per token.
 Weight format: NVFP4 (E2M1 packed uint8 + E4M3FN block scales).
 Input: BF16, Output: BF16.
 
@@ -56,6 +59,10 @@ _verdict_mma_ext = None
 # MMA path toggle: VLLM_VERDICT_MMA=1 enables MMA tensor core path
 _USE_MMA = os.environ.get("VLLM_VERDICT_MMA", "0") == "1"
 
+# Cooperative MMA kernel compile-time N_HALF (hardcoded in .cu).
+# When TP-sharded weight N_HALF doesn't match, fall back to scalar.
+_MMA_COMPILED_N_HALF = 1024
+
 _CUDA_FLAGS = [
     "-gencode=arch=compute_120a,code=sm_120a",
     "-O2",
@@ -90,7 +97,11 @@ def _get_verdict_ext():
 
 
 def _get_verdict_mma_ext():
-    """Load the MMA tensor core extension (NVF4 m16n8k64 + Swizzle<3,4,3>)."""
+    """Load the single fused cooperative kernel extension (SM120).
+
+    ONE kernel launch: BF16→FP4 → GEMM1 → SwiGLU → requant → GEMM2 → BF16.
+    Atomic barriers, CUDA-graph safe, no cooperative_groups.
+    """
     global _verdict_mma_ext
     if _verdict_mma_ext is not None:
         return _verdict_mma_ext
@@ -98,19 +109,22 @@ def _get_verdict_mma_ext():
     from torch.utils.cpp_extension import load
 
     csrc_dir = Path(__file__).parent / "csrc"
-    ext_src = csrc_dir / "verdict_mma_ext.cu"
+    ext_src = csrc_dir / "verdict_fused_cooperative_ext.cu"
 
     if not ext_src.exists():
-        raise FileNotFoundError(f"VerdictMoE MMA CUDA source not found: {ext_src}")
+        raise FileNotFoundError(
+            f"VerdictMoE fused cooperative CUDA source not found: {ext_src}")
 
-    logger.info("JIT-compiling VerdictMoE MMA CUDA extension (SM120)...")
+    logger.info(
+        "JIT-compiling VerdictMoE single fused cooperative extension (SM120)...")
     _verdict_mma_ext = load(
-        name="verdict_mma_ext",
+        name="verdict_fused_cooperative_ext",
         sources=[str(ext_src)],
         extra_cuda_cflags=_CUDA_FLAGS,
         verbose=False,
     )
-    logger.info("VerdictMoE MMA CUDA extension compiled successfully")
+    logger.info(
+        "VerdictMoE single fused cooperative extension compiled successfully")
     return _verdict_mma_ext
 
 
@@ -128,7 +142,7 @@ class VerdictMoEExperts(mk.FusedMoEExpertsModular):
     Task 4 validated: 38.9us per MoE layer (10 experts, M=1, 640 CTAs).
     """
 
-    TILES_PER_EXPERT = 64  # K=4096 / 64 = 64 cols per GEMM2 tile
+    MMA_BN = 64  # MMA N-tile width (hardware-fixed)
     MAX_BATCHED_TOKENS = 512
     MAX_EXPERTS_PER_TOK = 10
 
@@ -215,7 +229,7 @@ class VerdictMoEExperts(mk.FusedMoEExpertsModular):
         All forward-path tensors are slices of these buffers.
         """
         max_active = max_tokens * max_topk
-        tiles = self.TILES_PER_EXPERT
+        tiles = N_half // self.MMA_BN  # N-distributed tiles for MMA path
 
         # --- Big compute buffers ---
         # Partials: allocated per-call (size depends on M, the CUDA graph variable).
@@ -271,32 +285,57 @@ class VerdictMoEExperts(mk.FusedMoEExpertsModular):
             max_active, dtype=torch.float32, device=device,
         )
 
-        # --- MMA-specific FP4 buffers (only allocated if MMA enabled) ---
-        SF_BLOCK_ACT = 32  # UE8M0 quantization block size for activations
-        if _USE_MMA:
-            # Input FP4: quantized BF16 input
+        # --- Fused MMA-specific buffers (only if MMA enabled AND N_half matches) ---
+        SF_BLOCK = 16  # E4M3FN scale block size (matches weight scales)
+        self._mma_buffers_ready = False
+        if _USE_MMA and N_half == _MMA_COMPILED_N_HALF:
+            # Input FP4: quantized BF16 input (E4M3FN scales, SF_BLOCK=16)
             self._buf_input_fp4 = torch.empty(
                 max_tokens * (K // 2),
                 dtype=torch.uint8, device=device,
             )
             self._buf_input_sf = torch.empty(
-                max_tokens * (K // SF_BLOCK_ACT),
+                max_tokens * (K // SF_BLOCK),
                 dtype=torch.uint8, device=device,
             )
-            # Intermediate FP4: SwiGLU output
+            # Intermediate FP4: SwiGLU output (E4M3FN scales, SF_BLOCK=16)
             self._buf_inter_fp4 = torch.empty(
                 max_active * (N_half // 2),
                 dtype=torch.uint8, device=device,
             )
             self._buf_inter_sf = torch.empty(
-                max_active * (N_half // SF_BLOCK_ACT),
+                max_active * (N_half // SF_BLOCK),
                 dtype=torch.uint8, device=device,
             )
+            # Atomic barrier counter for fused cooperative kernel
+            self._buf_barrier = torch.zeros(
+                1, dtype=torch.int32, device=device,
+            )
+            # Partials buffer for cooperative kernel (reused per-token launch)
+            # topk * NUM_TILES * PARTIALS_PER_CTA
+            # NUM_TILES = (N_half/64) * 4 = 64, PARTIALS_PER_CTA = 128
+            num_tiles_coop = (N_half // 64) * 4
+            self._buf_partials = torch.empty(
+                max_topk * num_tiles_coop * 128,
+                dtype=torch.float32, device=device,
+            )
+            # Query max concurrent CTAs for deadlock safety check
+            props = torch.cuda.get_device_properties(device)
+            self._max_fused_ctas = 4 * props.multi_processor_count
+            self._mma_buffers_ready = True
             logger.info(
-                "VerdictMoE MMA FP4 buffers: input_fp4=%.1f KB, "
-                "inter_fp4=%.1f KB",
+                "VerdictMoE fused cooperative buffers: input_fp4=%.1f KB, "
+                "inter_fp4=%.1f KB, partials=%.1f KB, max_fused_ctas=%d",
                 (self._buf_input_fp4.nbytes + self._buf_input_sf.nbytes) / 1024,
                 (self._buf_inter_fp4.nbytes + self._buf_inter_sf.nbytes) / 1024,
+                self._buf_partials.nbytes / 1024,
+                self._max_fused_ctas,
+            )
+        elif _USE_MMA:
+            logger.info(
+                "VerdictMoE: MMA requested but N_half=%d != compiled %d "
+                "(TP-sharded), skipping MMA buffer allocation — scalar path",
+                N_half, _MMA_COMPILED_N_HALF,
             )
 
         # Store dimensions for debug/validation
@@ -318,16 +357,17 @@ class VerdictMoEExperts(mk.FusedMoEExpertsModular):
             + self._buf_w2_alpha_all.nbytes
             + self._buf_ones.nbytes
         )
-        if _USE_MMA:
+        if self._mma_buffers_ready:
             total_bytes += (
                 self._buf_input_fp4.nbytes + self._buf_input_sf.nbytes
                 + self._buf_inter_fp4.nbytes + self._buf_inter_sf.nbytes
+                + self._buf_partials.nbytes
             )
         logger.info(
             "VerdictMoE buffers allocated: %.1f MB "
             "(max_tokens=%d, max_topk=%d, K=%d, N_half=%d, mma=%s)",
             total_bytes / 1e6, max_tokens, max_topk, K, N_half,
-            "ON" if _USE_MMA else "OFF",
+            "ON" if self._mma_buffers_ready else "OFF",
         )
 
     _buffers_ready = False
@@ -396,7 +436,10 @@ class VerdictMoEExperts(mk.FusedMoEExpertsModular):
         if apply_router_weight_on_input:
             hidden_states = hidden_states * topk_weights.to(hidden_states.dtype)
 
-        tiles_per_expert = self.TILES_PER_EXPERT
+        # Compute tiles_per_expert from actual weight shape (N-distributed)
+        # MMA tiles = N_HALF / BN. Scalar tiles = K / BK (unchanged).
+        mma_tiles = N_half // self.MMA_BN  # 1024/64 = 16 for Qwen3.5
+        scalar_tiles = k // 64             # 4096/64 = 64 (K-distributed)
 
         # --- Normal path: use pre-allocated buffers (CUDA-graph safe) ---
         # --- Copy routing into pre-allocated int32/float32 buffers ---
@@ -427,11 +470,6 @@ class VerdictMoEExperts(mk.FusedMoEExpertsModular):
         )
 
         # --- Working buffers ---
-        # Partials: per-call allocation (size = f(M), deterministic per CUDA graph)
-        partials = torch.empty(
-            num_active * tiles_per_expert * 2 * N_half,
-            dtype=torch.float32, device=device,
-        )
         output_f32 = self._buf_output_f32[:m * k]
 
         # --- Cast block scales to uint8 (view, no allocation) ---
@@ -445,21 +483,37 @@ class VerdictMoEExperts(mk.FusedMoEExpertsModular):
             wts_for_kernel = expert_wts_flat
 
         # --- Dispatch: MMA or scalar path ---
-        if _USE_MMA:
+        # Cooperative MMA kernel has compile-time N_HALF. When TP-sharded
+        # weights produce a different N_HALF (e.g. TP=4 → 256), fall back
+        # to the scalar GEMV path which uses runtime N_half.
+        use_mma = _USE_MMA and (N_half == _MMA_COMPILED_N_HALF)
+        if _USE_MMA and not use_mma and not getattr(self, '_tp_fallback_logged', False):
+            logger.info(
+                "VerdictMoE: N_HALF=%d != compiled %d (TP-sharded), "
+                "falling back to scalar GEMV path",
+                N_half, _MMA_COMPILED_N_HALF,
+            )
+            self._tp_fallback_logged = True
+        if use_mma:
             self._apply_mma(
                 output, hidden_states, w1, w2,
                 w1_sf, w2_sf, w1_alpha, w2_alpha,
                 expert_ids_flat, wts_for_kernel, token_ids_flat,
-                partials, output_f32,
-                k, N_half, num_active, tiles_per_expert, m,
+                output_f32,
+                k, N_half, num_active, mma_tiles, m,
             )
         else:
+            # Scalar path still needs partials (K-distributed with 64 tiles)
+            partials = torch.empty(
+                num_active * scalar_tiles * 2 * N_half,
+                dtype=torch.float32, device=device,
+            )
             self._apply_scalar(
                 output, hidden_states, w1, w2,
                 w1_sf, w2_sf, w1_alpha, w2_alpha,
                 expert_ids_flat, wts_for_kernel, token_ids_flat,
                 partials, output_f32,
-                k, N_half, num_active, tiles_per_expert,
+                k, N_half, num_active, scalar_tiles,
             )
 
     # ========================================================================
@@ -495,27 +549,29 @@ class VerdictMoEExperts(mk.FusedMoEExpertsModular):
         )
 
     # ========================================================================
-    # MMA tensor core path (NVF4 m16n8k64 + Swizzle<3,4,3>)
+    # Single Fused Cooperative MMA (ONE kernel launch per token)
+    # BF16→FP4→GEMM1→SwiGLU→requant→GEMM2→BF16, all inside one kernel.
+    # Atomic barriers, CUDA-graph safe. Loops over M tokens in C++.
     # ========================================================================
     def _apply_mma(
         self, output, hidden_states, w1, w2,
         w1_sf, w2_sf, w1_alpha, w2_alpha,
         expert_ids_flat, wts_for_kernel, token_ids_flat,
-        partials, output_f32,
+        output_f32,
         k, N_half, num_active, tiles_per_expert, m,
     ):
-        ext_mma = _get_verdict_mma_ext()
+        ext_coop = _get_verdict_mma_ext()
 
-        # Slice pre-allocated FP4 buffers
-        input_fp4 = self._buf_input_fp4[:m * (k // 2)]
-        input_sf = self._buf_input_sf[:m * (k // 32)]
-        inter_fp4 = self._buf_inter_fp4[:num_active * (N_half // 2)]
-        inter_sf = self._buf_inter_sf[:num_active * (N_half // 32)]
+        topk = num_active // m  # experts per token
 
-        # 5-kernel MMA pipeline:
-        #   K0: BF16→NVFP4 | K1: GEMM1 MMA | K2: SwiGLU+FP4 |
-        #   K3: GEMM2 MMA+scatter | K4: F32→BF16
-        ext_mma.forward(
+        # Slice pre-allocated buffers (reused per-token inside the C++ loop)
+        input_fp4 = self._buf_input_fp4[:k // 2]
+        input_sf = self._buf_input_sf[:k // 16]
+        inter_fp4 = self._buf_inter_fp4[:topk * (N_half // 2)]
+        inter_sf = self._buf_inter_sf[:topk * (N_half // 16)]
+
+        # Single fused cooperative kernel — ONE launch per token, M launches total
+        ext_coop.forward(
             hidden_states.contiguous(),
             w1.contiguous(),
             w1_sf.contiguous(),
@@ -526,12 +582,12 @@ class VerdictMoEExperts(mk.FusedMoEExpertsModular):
             output,
             expert_ids_flat,
             wts_for_kernel,
-            token_ids_flat,
-            partials,
             output_f32,
             input_fp4,
             input_sf,
+            self._buf_partials,
             inter_fp4,
             inter_sf,
-            k, N_half, num_active, tiles_per_expert,
+            self._buf_barrier,
+            k, N_half, num_active, topk,
         )
