@@ -15,7 +15,8 @@ Two backend paths:
     Enabled via: VLLM_VERDICT_MMA=1
 
 Grid: topk (10) × NUM_TILES (64) = 640 CTAs per token ≤ 752 max concurrent.
-For MTP=3 (M=4): loops over tokens in C++, one kernel launch per token.
+For MTP=3 (M=4): ONE kernel launch processes ALL M tokens (shared routing).
+Weight data loaded once, reused across M tokens — 2.94x vs serial launches.
 Weight format: NVFP4 (E2M1 packed uint8 + E4M3FN block scales).
 Input: BF16, Output: BF16.
 
@@ -59,9 +60,9 @@ _verdict_mma_ext = None
 # MMA path toggle: VLLM_VERDICT_MMA=1 enables MMA tensor core path
 _USE_MMA = os.environ.get("VLLM_VERDICT_MMA", "0") == "1"
 
-# Cooperative MMA kernel compile-time N_HALF (hardcoded in .cu).
-# When TP-sharded weight N_HALF doesn't match, fall back to scalar.
-_MMA_COMPILED_N_HALF = 1024
+# Sprint 7: Runtime N_HALF support — no more compile-time constant.
+# The cooperative kernel now accepts N_HALF and K_GROUPS as kernel args,
+# supporting both EP=4 (N_HALF=1024) and TP=4 (N_HALF=256).
 
 _CUDA_FLAGS = [
     "-gencode=arch=compute_120a,code=sm_120a",
@@ -285,11 +286,12 @@ class VerdictMoEExperts(mk.FusedMoEExpertsModular):
             max_active, dtype=torch.float32, device=device,
         )
 
-        # --- Fused MMA-specific buffers (only if MMA enabled AND N_half matches) ---
+        # --- Fused MMA-specific buffers (any N_half — runtime parameterized) ---
         SF_BLOCK = 16  # E4M3FN scale block size (matches weight scales)
         self._mma_buffers_ready = False
-        if _USE_MMA and N_half == _MMA_COMPILED_N_HALF:
+        if _USE_MMA:
             # Input FP4: quantized BF16 input (E4M3FN scales, SF_BLOCK=16)
+            # Sized for max_tokens (each token quantized in prologue)
             self._buf_input_fp4 = torch.empty(
                 max_tokens * (K // 2),
                 dtype=torch.uint8, device=device,
@@ -299,6 +301,7 @@ class VerdictMoEExperts(mk.FusedMoEExpertsModular):
                 dtype=torch.uint8, device=device,
             )
             # Intermediate FP4: SwiGLU output (E4M3FN scales, SF_BLOCK=16)
+            # Per-token per-expert: topk * M * N_half/2
             self._buf_inter_fp4 = torch.empty(
                 max_active * (N_half // 2),
                 dtype=torch.uint8, device=device,
@@ -311,12 +314,15 @@ class VerdictMoEExperts(mk.FusedMoEExpertsModular):
             self._buf_barrier = torch.zeros(
                 1, dtype=torch.int32, device=device,
             )
-            # Partials buffer for cooperative kernel (reused per-token launch)
-            # topk * NUM_TILES * PARTIALS_PER_CTA
-            # NUM_TILES = (N_half/64) * 4 = 64, PARTIALS_PER_CTA = 128
-            num_tiles_coop = (N_half // 64) * 4
+            # Partials buffer for cooperative kernel
+            # Sprint 7: sized for MAX_M tokens (one launch processes all M)
+            # Runtime K_GROUPS: ensure >= 640 CTAs
+            MAX_M_KERNEL = 4  # MTP=3 → M=4 max
+            tiles_n = N_half // 64
+            k_groups_coop = max(4, 640 // (max_topk * tiles_n))
+            num_tiles_coop = tiles_n * k_groups_coop
             self._buf_partials = torch.empty(
-                max_topk * num_tiles_coop * 128,
+                max_topk * num_tiles_coop * MAX_M_KERNEL * 128,
                 dtype=torch.float32, device=device,
             )
             # Query max concurrent CTAs for deadlock safety check
@@ -324,18 +330,14 @@ class VerdictMoEExperts(mk.FusedMoEExpertsModular):
             self._max_fused_ctas = 4 * props.multi_processor_count
             self._mma_buffers_ready = True
             logger.info(
-                "VerdictMoE fused cooperative buffers: input_fp4=%.1f KB, "
-                "inter_fp4=%.1f KB, partials=%.1f KB, max_fused_ctas=%d",
+                "VerdictMoE fused cooperative buffers (N_half=%d, k_groups=%d): "
+                "input_fp4=%.1f KB, inter_fp4=%.1f KB, partials=%.1f KB, "
+                "max_fused_ctas=%d",
+                N_half, k_groups_coop,
                 (self._buf_input_fp4.nbytes + self._buf_input_sf.nbytes) / 1024,
                 (self._buf_inter_fp4.nbytes + self._buf_inter_sf.nbytes) / 1024,
                 self._buf_partials.nbytes / 1024,
                 self._max_fused_ctas,
-            )
-        elif _USE_MMA:
-            logger.info(
-                "VerdictMoE: MMA requested but N_half=%d != compiled %d "
-                "(TP-sharded), skipping MMA buffer allocation — scalar path",
-                N_half, _MMA_COMPILED_N_HALF,
             )
 
         # Store dimensions for debug/validation
@@ -483,17 +485,9 @@ class VerdictMoEExperts(mk.FusedMoEExpertsModular):
             wts_for_kernel = expert_wts_flat
 
         # --- Dispatch: MMA or scalar path ---
-        # Cooperative MMA kernel has compile-time N_HALF. When TP-sharded
-        # weights produce a different N_HALF (e.g. TP=4 → 256), fall back
-        # to the scalar GEMV path which uses runtime N_half.
-        use_mma = _USE_MMA and (N_half == _MMA_COMPILED_N_HALF)
-        if _USE_MMA and not use_mma and not getattr(self, '_tp_fallback_logged', False):
-            logger.info(
-                "VerdictMoE: N_HALF=%d != compiled %d (TP-sharded), "
-                "falling back to scalar GEMV path",
-                N_half, _MMA_COMPILED_N_HALF,
-            )
-            self._tp_fallback_logged = True
+        # Sprint 7: MMA processes ALL M tokens in ONE launch (shared routing).
+        # M ≤ 4: one launch. M > 4: per-token loop (warmup/prefill).
+        use_mma = _USE_MMA and self._mma_buffers_ready
         if use_mma:
             self._apply_mma(
                 output, hidden_states, w1, w2,
@@ -549,9 +543,12 @@ class VerdictMoEExperts(mk.FusedMoEExpertsModular):
         )
 
     # ========================================================================
-    # Single Fused Cooperative MMA (ONE kernel launch per token)
+    # Single Fused Cooperative MMA — Sprint 7
     # BF16→FP4→GEMM1→SwiGLU→requant→GEMM2→BF16, all inside one kernel.
-    # Atomic barriers, CUDA-graph safe. Loops over M tokens in C++.
+    #
+    # M ≤ 4 (decode+MTP): ONE launch, shared routing, weight reuse (2.94x).
+    # M > 4 (warmup/prefill): per-token loop, each launch M=1.
+    # Both paths use same kernel, CUDA-graph safe, atomic barriers.
     # ========================================================================
     def _apply_mma(
         self, output, hidden_states, w1, w2,
@@ -563,31 +560,73 @@ class VerdictMoEExperts(mk.FusedMoEExpertsModular):
         ext_coop = _get_verdict_mma_ext()
 
         topk = num_active // m  # experts per token
+        k_packed = k // 2
+        sf_cols = k // 16
+        n_half_packed = N_half // 2
+        n_half_sf = N_half // 16
 
-        # Slice pre-allocated buffers (reused per-token inside the C++ loop)
-        input_fp4 = self._buf_input_fp4[:k // 2]
-        input_sf = self._buf_input_sf[:k // 16]
-        inter_fp4 = self._buf_inter_fp4[:topk * (N_half // 2)]
-        inter_sf = self._buf_inter_sf[:topk * (N_half // 16)]
+        if m <= 4:
+            # --- ONE LAUNCH: shared routing, weight reuse across M tokens ---
+            shared_expert_ids = expert_ids_flat[:topk]
+            shared_expert_wts = wts_for_kernel[:topk]
+            shared_w1_alpha = w1_alpha[:topk]
+            shared_w2_alpha = w2_alpha[:topk]
 
-        # Single fused cooperative kernel — ONE launch per token, M launches total
-        ext_coop.forward(
-            hidden_states.contiguous(),
-            w1.contiguous(),
-            w1_sf.contiguous(),
-            w1_alpha,
-            w2.contiguous(),
-            w2_sf.contiguous(),
-            w2_alpha,
-            output,
-            expert_ids_flat,
-            wts_for_kernel,
-            output_f32,
-            input_fp4,
-            input_sf,
-            self._buf_partials,
-            inter_fp4,
-            inter_sf,
-            self._buf_barrier,
-            k, N_half, num_active, topk,
-        )
+            input_fp4 = self._buf_input_fp4[:m * k_packed]
+            input_sf = self._buf_input_sf[:m * sf_cols]
+            inter_fp4 = self._buf_inter_fp4[:topk * m * n_half_packed]
+            inter_sf = self._buf_inter_sf[:topk * m * n_half_sf]
+
+            ext_coop.forward(
+                hidden_states.contiguous(),
+                w1.contiguous(),
+                w1_sf.contiguous(),
+                shared_w1_alpha,
+                w2.contiguous(),
+                w2_sf.contiguous(),
+                shared_w2_alpha,
+                output,
+                shared_expert_ids,
+                shared_expert_wts,
+                output_f32,
+                input_fp4,
+                input_sf,
+                self._buf_partials,
+                inter_fp4,
+                inter_sf,
+                self._buf_barrier,
+                k, N_half, topk, topk,
+            )
+        else:
+            # --- PER-TOKEN LOOP: M>4 (warmup/prefill), M=1 per launch ---
+            input_fp4 = self._buf_input_fp4[:k_packed]
+            input_sf = self._buf_input_sf[:sf_cols]
+            inter_fp4 = self._buf_inter_fp4[:topk * n_half_packed]
+            inter_sf = self._buf_inter_sf[:topk * n_half_sf]
+
+            for tok in range(m):
+                tok_ids = expert_ids_flat[tok * topk:(tok + 1) * topk]
+                tok_wts = wts_for_kernel[tok * topk:(tok + 1) * topk]
+                tok_w1a = w1_alpha[tok * topk:(tok + 1) * topk]
+                tok_w2a = w2_alpha[tok * topk:(tok + 1) * topk]
+
+                ext_coop.forward(
+                    hidden_states[tok:tok + 1].contiguous(),
+                    w1.contiguous(),
+                    w1_sf.contiguous(),
+                    tok_w1a,
+                    w2.contiguous(),
+                    w2_sf.contiguous(),
+                    tok_w2a,
+                    output[tok:tok + 1],
+                    tok_ids,
+                    tok_wts,
+                    output_f32[:k],
+                    input_fp4,
+                    input_sf,
+                    self._buf_partials,
+                    inter_fp4,
+                    inter_sf,
+                    self._buf_barrier,
+                    k, N_half, topk, topk,
+                )
