@@ -5,6 +5,8 @@ Subclasses FlashAttentionBackend to intercept decode-only batches (max_query_len
 and dispatch to the SM120-native split-KV decode kernel. Prefill and mixed batches
 fall through to the standard FlashAttention path.
 
+Supports both BF16 and FP8 E4M3 KV cache dtypes.
+
 Usage:
     # In vLLM startup or plugin initialization:
     from vllm.v1.attention.backends.registry import register_backend, AttentionBackendEnum
@@ -108,8 +110,9 @@ class SM120FlashAttentionImpl(FlashAttentionImpl):
         try:
             _get_sm120_decode()
             self._sm120_decode_available = True
-            logger.info("SM120 decode kernel: enabled (head_dim=%d, GQA=%d:%d)",
-                        self.head_size, self.num_heads, self.num_kv_heads)
+            kv_dtype_str = self.kv_cache_dtype
+            logger.info("SM120 decode kernel: enabled (head_dim=%d, GQA=%d:%d, kv_dtype=%s)",
+                        self.head_size, self.num_heads, self.num_kv_heads, kv_dtype_str)
         except Exception as e:
             logger.warning("SM120 decode kernel: disabled (%s), falling back to FA", e)
 
@@ -140,20 +143,19 @@ class SM120FlashAttentionImpl(FlashAttentionImpl):
         # 3. Decoder attention (not encoder)
         # 4. No cascade (cascade uses different metadata)
         # 5. No DCP (decode context parallelism)
-        # 6. BF16 KV cache (FP8 not yet supported in our kernel)
+        # 6. BF16 or FP8 E4M3 KV cache (both supported)
         can_use_sm120 = (
             self._sm120_decode_available
             and attn_metadata.max_query_len == 1
             and self.attn_type == AttentionType.DECODER
             and not attn_metadata.use_cascade
-            and not self.kv_cache_dtype.startswith("fp8")
             and self.alibi_slopes is None
             and self.sliding_window == (-1, -1)
         )
 
         if can_use_sm120:
             return self._forward_sm120_decode(
-                query, kv_cache, attn_metadata, output
+                layer, query, kv_cache, attn_metadata, output
             )
 
         # Fall through to standard FlashAttention for everything else
@@ -164,6 +166,7 @@ class SM120FlashAttentionImpl(FlashAttentionImpl):
 
     def _forward_sm120_decode(
         self,
+        layer: torch.nn.Module,
         query: torch.Tensor,        # [num_tokens, num_q_heads, head_dim]
         kv_cache: torch.Tensor,      # [2, num_blocks, block_size, num_kv_heads, head_dim]
         attn_metadata: FlashAttentionMetadata,
@@ -182,8 +185,11 @@ class SM120FlashAttentionImpl(FlashAttentionImpl):
             num_tokens, self.num_heads, self.head_size, query.device
         )
 
+        # Get KV dequant scales from layer (default 1.0 for BF16)
+        k_scale = getattr(layer, '_k_scale_float', 1.0)
+        v_scale = getattr(layer, '_v_scale_float', 1.0)
+
         # Call SM120 decode kernel
-        # Pass max_seq_len to avoid GPU->CPU sync from seq_lens.max().item()
         max_sl = getattr(attn_metadata, 'max_seq_len', None)
         result = ext.sm120_flash_decode_paged(
             query=q,
@@ -194,6 +200,8 @@ class SM120FlashAttentionImpl(FlashAttentionImpl):
             output=output[:num_tokens],
             workspace=workspace,
             max_seq_len=max_sl,
+            k_scale=k_scale,
+            v_scale=v_scale,
         )
 
         return output

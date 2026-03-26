@@ -3,6 +3,8 @@ SM120 Flash Decode — PyTorch extension for paged KV cache decode attention.
 
 Builds the CUDA kernel as a JIT torch extension and provides a Python interface
 matching vLLM's attention conventions.
+
+Supports both BF16 and FP8 E4M3 KV cache dtypes.
 """
 
 import os
@@ -11,19 +13,21 @@ from torch.utils.cpp_extension import load_inline
 
 _CSRC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "csrc")
 
-# Read the CUDA source (v2: tiled vectorized with cp.async bulk loads)
+# Read the CUDA source (v2: tiled vectorized with cp.async bulk loads + FP8 support)
 _V2_PATH = os.path.join(_CSRC_DIR, "sm120_flash_decode_v2_paged.cu")
 _V1_PATH = os.path.join(_CSRC_DIR, "sm120_flash_decode_paged.cu")
 _KERNEL_PATH = _V2_PATH if os.path.exists(_V2_PATH) else _V1_PATH
 with open(_KERNEL_PATH, "r") as f:
     _CUDA_SOURCE = f.read()
 
-# C++ wrapper that calls the extern "C" launcher via torch tensors
+# C++ wrapper that calls the extern "C" launchers via torch tensors
 _CPP_SOURCE = r"""
 #include <torch/extension.h>
 #include <c10/cuda/CUDAStream.h>
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 
+// BF16 KV cache launcher
 extern "C" void sm120_flash_decode_paged_launch(
     const __nv_bfloat16* Q,
     const __nv_bfloat16* key_cache,
@@ -44,16 +48,41 @@ extern "C" void sm120_flash_decode_paged_launch(
     cudaStream_t stream
 );
 
+// FP8 E4M3 KV cache launcher
+extern "C" void sm120_flash_decode_paged_fp8_launch(
+    const __nv_bfloat16* Q,
+    const __nv_fp8_e4m3* key_cache,
+    const __nv_fp8_e4m3* val_cache,
+    const int* block_table,
+    const int* seq_lens,
+    __nv_bfloat16* O,
+    float* partial_O,
+    float* partial_lse,
+    int batch_size,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    int max_seq_len,
+    int block_size,
+    int max_blocks_per_seq,
+    int max_splits,
+    float k_scale,
+    float v_scale,
+    cudaStream_t stream
+);
+
 std::vector<torch::Tensor> sm120_flash_decode(
     torch::Tensor query,           // [batch, num_q_heads, head_dim] bf16
-    torch::Tensor key_cache,       // [num_blocks, block_size, num_kv_heads, head_dim] bf16
-    torch::Tensor value_cache,     // [num_blocks, block_size, num_kv_heads, head_dim] bf16
+    torch::Tensor key_cache,       // [num_blocks, block_size, num_kv_heads, head_dim] bf16 or fp8
+    torch::Tensor value_cache,     // [num_blocks, block_size, num_kv_heads, head_dim] bf16 or fp8
     torch::Tensor block_table,     // [num_seqs, max_blocks_per_seq] int32
     torch::Tensor seq_lens,        // [num_seqs] int32
     torch::Tensor output,          // [batch, num_q_heads, head_dim] bf16 (pre-allocated)
     torch::Tensor partial_O,       // [max_splits, batch*num_q_heads, head_dim] float32
     torch::Tensor partial_lse,     // [max_splits, batch*num_q_heads] float32
-    int max_seq_len
+    int max_seq_len,
+    double k_scale,                // KV dequant scale for K (1.0 for BF16)
+    double v_scale                 // KV dequant scale for V (1.0 for BF16)
 ) {
     int batch_size = query.size(0);
     int num_q_heads = query.size(1);
@@ -65,25 +94,51 @@ std::vector<torch::Tensor> sm120_flash_decode(
 
     auto stream = c10::cuda::getCurrentCUDAStream().stream();
 
-    sm120_flash_decode_paged_launch(
-        reinterpret_cast<const __nv_bfloat16*>(query.data_ptr()),
-        reinterpret_cast<const __nv_bfloat16*>(key_cache.data_ptr()),
-        reinterpret_cast<const __nv_bfloat16*>(value_cache.data_ptr()),
-        block_table.data_ptr<int>(),
-        seq_lens.data_ptr<int>(),
-        reinterpret_cast<__nv_bfloat16*>(output.data_ptr()),
-        partial_O.data_ptr<float>(),
-        partial_lse.data_ptr<float>(),
-        batch_size,
-        num_q_heads,
-        num_kv_heads,
-        head_dim,
-        max_seq_len,
-        block_size,
-        max_blocks_per_seq,
-        max_splits,
-        stream
-    );
+    bool is_fp8 = (key_cache.scalar_type() == torch::kFloat8_e4m3fn);
+
+    if (is_fp8) {
+        sm120_flash_decode_paged_fp8_launch(
+            reinterpret_cast<const __nv_bfloat16*>(query.data_ptr()),
+            reinterpret_cast<const __nv_fp8_e4m3*>(key_cache.data_ptr()),
+            reinterpret_cast<const __nv_fp8_e4m3*>(value_cache.data_ptr()),
+            block_table.data_ptr<int>(),
+            seq_lens.data_ptr<int>(),
+            reinterpret_cast<__nv_bfloat16*>(output.data_ptr()),
+            partial_O.data_ptr<float>(),
+            partial_lse.data_ptr<float>(),
+            batch_size,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            max_seq_len,
+            block_size,
+            max_blocks_per_seq,
+            max_splits,
+            (float)k_scale,
+            (float)v_scale,
+            stream
+        );
+    } else {
+        sm120_flash_decode_paged_launch(
+            reinterpret_cast<const __nv_bfloat16*>(query.data_ptr()),
+            reinterpret_cast<const __nv_bfloat16*>(key_cache.data_ptr()),
+            reinterpret_cast<const __nv_bfloat16*>(value_cache.data_ptr()),
+            block_table.data_ptr<int>(),
+            seq_lens.data_ptr<int>(),
+            reinterpret_cast<__nv_bfloat16*>(output.data_ptr()),
+            partial_O.data_ptr<float>(),
+            partial_lse.data_ptr<float>(),
+            batch_size,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            max_seq_len,
+            block_size,
+            max_blocks_per_seq,
+            max_splits,
+            stream
+        );
+    }
 
     return {output};
 }
@@ -135,19 +190,22 @@ class SM120FlashDecodeWorkspace:
 
 def sm120_flash_decode_paged(
     query: torch.Tensor,        # [batch, num_q_heads, head_dim] bf16
-    key_cache: torch.Tensor,    # [num_blocks, block_size, num_kv_heads, head_dim] bf16
-    value_cache: torch.Tensor,  # [num_blocks, block_size, num_kv_heads, head_dim] bf16
+    key_cache: torch.Tensor,    # [num_blocks, block_size, num_kv_heads, head_dim] bf16 or fp8
+    value_cache: torch.Tensor,  # [num_blocks, block_size, num_kv_heads, head_dim] bf16 or fp8
     block_table: torch.Tensor,  # [num_seqs, max_blocks_per_seq] int32
     seq_lens: torch.Tensor,     # [num_seqs] int32
     output: torch.Tensor | None = None,
     workspace: SM120FlashDecodeWorkspace | None = None,
     max_seq_len: int | None = None,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
 ) -> torch.Tensor:
     """
     SM120-native flash decode attention with paged KV cache.
 
+    Supports both BF16 and FP8 E4M3 KV cache dtypes.
+    For FP8: pass k_scale and v_scale for dequantization.
     For decode: query has shape [batch, num_q_heads, head_dim] (one token per seq).
-    Output shape: [batch, num_q_heads, head_dim].
     Pass max_seq_len to avoid GPU->CPU sync from seq_lens.max().item().
     """
     mod = _get_module()
@@ -183,6 +241,8 @@ def sm120_flash_decode_paged(
         partial_O,
         partial_lse,
         max_seq_len,
+        k_scale,
+        v_scale,
     )
 
     return output

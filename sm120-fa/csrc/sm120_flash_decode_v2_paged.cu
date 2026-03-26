@@ -9,17 +9,46 @@
  *   5. Fully unrollable P@V inner loop (BLOCK_KV is compile-time)
  *   6. CUDA graph compatible (pre-allocated workspace)
  *
- * Supports: HEAD_DIM 128/256, GQA, variable seqlen, BF16 KV cache.
+ * Supports: HEAD_DIM 128/256, GQA, variable seqlen, BF16 and FP8 E4M3 KV cache.
  * KV cache layout (vLLM): [num_blocks, block_size, num_kv_heads, head_dim]
+ *
+ * FP8 KV cache support:
+ *   - Template parameter FP8_KV selects BF16 (2B) or FP8 E4M3 (1B) KV dtype
+ *   - FP8 halves HBM bandwidth for KV loads (1B vs 2B per element)
+ *   - Dequantization: FP8 → float on SMEM read (negligible ALU cost)
+ *   - k_scale absorbed into QK softmax scale (one multiply, not N)
+ *   - v_scale applied at output normalization (one multiply per dim)
  */
 
 #include <cuda.h>
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #include <float.h>
 #include <math.h>
 
 #define WARP_SIZE 32
+
+// ---- Type helpers ----
+template <bool FP8_KV>
+struct KVType {
+    using type = __nv_bfloat16;
+};
+template <>
+struct KVType<true> {
+    using type = __nv_fp8_e4m3;
+};
+
+template <bool FP8_KV>
+using kv_dtype_t = typename KVType<FP8_KV>::type;
+
+// Convert KV element to float
+__device__ __forceinline__ float kv_to_float(__nv_bfloat16 val) {
+    return __bfloat162float(val);
+}
+__device__ __forceinline__ float kv_to_float(__nv_fp8_e4m3 val) {
+    return float(val);
+}
 
 // ---- cp.async intrinsics ----
 __device__ __forceinline__ void cp_async_16B(void* smem_dst, const void* gmem_src) {
@@ -35,17 +64,18 @@ __device__ __forceinline__ void cp_async_wait_all() {
 
 // ============================================================================
 // Paged tile loader: gathers BLOCK_KV rows from paged cache into SMEM
-// Each row is HEAD_DIM bf16 elements; rows may span different physical pages.
-// Uses cp.async 16B (8 bf16 elements per load) for vectorized transfer.
+// Each row is HEAD_DIM elements of kv_dtype_t; rows may span different pages.
+// Uses cp.async 16B vectorized transfer.
+//   BF16: 8 elements per 16B load, FP8: 16 elements per 16B load
 // ============================================================================
-template <int HEAD_DIM, int BLOCK_KV>
+template <int HEAD_DIM, int BLOCK_KV, bool FP8_KV>
 __device__ __forceinline__ void load_paged_tile(
-    __nv_bfloat16* __restrict__ kv_smem,        // [BLOCK_KV, HEAD_DIM] destination
-    const __nv_bfloat16* __restrict__ cache,     // global KV cache
-    const int* __restrict__ block_table,         // [num_seqs, max_blocks_per_seq]
+    kv_dtype_t<FP8_KV>* __restrict__ kv_smem,           // [BLOCK_KV, HEAD_DIM] destination
+    const kv_dtype_t<FP8_KV>* __restrict__ cache,       // global KV cache
+    const int* __restrict__ block_table,
     int seq_idx,
-    int tile_start,       // first KV position in this tile
-    int tile_end,         // one past last valid KV position
+    int tile_start,
+    int tile_end,
     int kv_head,
     int block_size,
     int num_kv_heads,
@@ -53,7 +83,8 @@ __device__ __forceinline__ void load_paged_tile(
     int tid,
     int num_threads
 ) {
-    constexpr int CHUNK_ELEMS = 8;   // bf16 elements per 16B load
+    constexpr int ELEM_BYTES = sizeof(kv_dtype_t<FP8_KV>);  // 1 for FP8, 2 for BF16
+    constexpr int CHUNK_ELEMS = 16 / ELEM_BYTES;             // 16 for FP8, 8 for BF16
     constexpr int TOTAL_CHUNKS = BLOCK_KV * HEAD_DIM / CHUNK_ELEMS;
 
     #pragma unroll 4
@@ -69,7 +100,7 @@ __device__ __forceinline__ void load_paged_tile(
             const int src = ((blk * block_size + page_off) * num_kv_heads + kv_head) * HEAD_DIM + d;
             cp_async_16B(&kv_smem[kv_local * HEAD_DIM + d], &cache[src]);
         } else {
-            // Zero-fill out-of-bounds positions
+            // Zero-fill out-of-bounds positions (16 bytes regardless of dtype)
             uint4* dst = reinterpret_cast<uint4*>(&kv_smem[kv_local * HEAD_DIM + d]);
             *dst = make_uint4(0, 0, 0, 0);
         }
@@ -84,16 +115,15 @@ __device__ __forceinline__ void load_paged_tile(
 // Grid:  (num_splits, batch_size, num_q_heads)
 // Block: HEAD_DIM threads
 //
-// Each CTA processes kv_per_split KV positions in BLOCK_KV-sized tiles.
-// Q@K^T uses R = HEAD_DIM/BLOCK_KV threads per score with shfl reduction.
-// P@V uses 1 thread per output dimension.
+// Template: FP8_KV=false → BF16 KV, FP8_KV=true → FP8 E4M3 KV
+// When FP8_KV: scale includes k_scale factor, v_scale applied at output.
 // ============================================================================
-template <int HEAD_DIM, int BLOCK_KV>
+template <int HEAD_DIM, int BLOCK_KV, bool FP8_KV>
 __global__ void __launch_bounds__(HEAD_DIM, 2)
 tiled_split_kv_partial_paged(
     const __nv_bfloat16* __restrict__ Q,
-    const __nv_bfloat16* __restrict__ key_cache,
-    const __nv_bfloat16* __restrict__ val_cache,
+    const kv_dtype_t<FP8_KV>* __restrict__ key_cache,
+    const kv_dtype_t<FP8_KV>* __restrict__ val_cache,
     const int* __restrict__ block_table,
     const int* __restrict__ seq_lens,
     float* __restrict__ partial_O,
@@ -102,7 +132,8 @@ tiled_split_kv_partial_paged(
     int num_kv_heads,
     int block_size,
     int max_blocks_per_seq,
-    float scale,
+    float scale,          // = 1/sqrt(d) * k_scale when FP8_KV
+    float v_scale,        // applied at output (1.0 for BF16)
     int kv_per_split
 ) {
     const int split_idx = blockIdx.x;
@@ -134,16 +165,17 @@ tiled_split_kv_partial_paged(
     }
 
     // ---- Shared memory layout ----
-    // q_smem:  [HEAD_DIM] float        -- Q vector (converted to FP32)
-    // kv_smem: [BLOCK_KV * HEAD_DIM] bf16 -- K or V tile (reused)
-    // p_smem:  [BLOCK_KV + 4] float    -- scores + softmax metadata
+    // q_smem:  [HEAD_DIM] float                            -- Q vector (FP32)
+    // kv_smem: [BLOCK_KV * HEAD_DIM] kv_dtype              -- K or V tile (reused)
+    // p_smem:  [BLOCK_KV + 4] float                        -- scores + softmax metadata
+    constexpr int KV_SMEM_BYTES = BLOCK_KV * HEAD_DIM * sizeof(kv_dtype_t<FP8_KV>);
+
     extern __shared__ char smem_raw[];
-    float*          q_smem  = reinterpret_cast<float*>(smem_raw);
-    __nv_bfloat16*  kv_smem = reinterpret_cast<__nv_bfloat16*>(
+    float* q_smem = reinterpret_cast<float*>(smem_raw);
+    kv_dtype_t<FP8_KV>* kv_smem = reinterpret_cast<kv_dtype_t<FP8_KV>*>(
                               smem_raw + HEAD_DIM * sizeof(float));
-    float*          p_smem  = reinterpret_cast<float*>(
-                              smem_raw + HEAD_DIM * sizeof(float)
-                              + BLOCK_KV * HEAD_DIM * sizeof(__nv_bfloat16));
+    float* p_smem = reinterpret_cast<float*>(
+                              smem_raw + HEAD_DIM * sizeof(float) + KV_SMEM_BYTES);
 
     // Load Q into shared memory (FP32 for dot product precision)
     {
@@ -154,19 +186,18 @@ tiled_split_kv_partial_paged(
     __syncthreads();
 
     // ---- Thread assignment for Q@K^T ----
-    // R threads per score, each handles HEAD_DIM/R elements of the dot product
     constexpr int R = HEAD_DIM / BLOCK_KV;
     static_assert(R >= 1 && (R & (R - 1)) == 0, "R must be power of 2");
     constexpr int D_PER_THREAD = HEAD_DIM / R;
 
-    const int score_idx   = tid / R;         // which score (0..BLOCK_KV-1)
-    const int sub_tid     = tid % R;         // sub-thread within score group
+    const int score_idx   = tid / R;
+    const int sub_tid     = tid % R;
     const int d_start_qk  = sub_tid * D_PER_THREAD;
 
     // Online softmax state
     float rowmax = -FLT_MAX;
     float rowsum = 0.0f;
-    float o_val  = 0.0f;   // output accumulator for dimension `tid`
+    float o_val  = 0.0f;
 
     // Tile loop
     const int total_kv  = kv_end - kv_start;
@@ -181,7 +212,7 @@ tiled_split_kv_partial_paged(
         // ==============================================================
         // Step 1: Load K tile from paged cache
         // ==============================================================
-        load_paged_tile<HEAD_DIM, BLOCK_KV>(
+        load_paged_tile<HEAD_DIM, BLOCK_KV, FP8_KV>(
             kv_smem, key_cache, block_table, seq_idx,
             tile_start, tile_end, kv_head,
             block_size, num_kv_heads, max_blocks_per_seq,
@@ -194,12 +225,12 @@ tiled_split_kv_partial_paged(
         // ==============================================================
         float dot = 0.0f;
         if (score_idx < tile_len) {
-            const __nv_bfloat16* k_row = &kv_smem[score_idx * HEAD_DIM + d_start_qk];
+            const kv_dtype_t<FP8_KV>* k_row = &kv_smem[score_idx * HEAD_DIM + d_start_qk];
             const float* q_row = &q_smem[d_start_qk];
 
             #pragma unroll 16
             for (int d = 0; d < D_PER_THREAD; d++) {
-                dot += q_row[d] * __bfloat162float(k_row[d]);
+                dot += q_row[d] * kv_to_float(k_row[d]);
             }
 
             // Reduce within R-thread group via shuffle
@@ -208,10 +239,10 @@ tiled_split_kv_partial_paged(
             if constexpr (R >= 8) dot += __shfl_xor_sync(0xffffffff, dot, 4);
         }
 
+        // scale already includes k_scale when FP8_KV
         float score = dot * scale;
         if (score_idx >= tile_len) score = -FLT_MAX;
 
-        // One thread per score writes to p_smem
         if (sub_tid == 0 && score_idx < BLOCK_KV)
             p_smem[score_idx] = score;
         __syncthreads();
@@ -219,41 +250,35 @@ tiled_split_kv_partial_paged(
         // ==============================================================
         // Step 3: Start V tile load (overlapped with softmax)
         // ==============================================================
-        load_paged_tile<HEAD_DIM, BLOCK_KV>(
+        load_paged_tile<HEAD_DIM, BLOCK_KV, FP8_KV>(
             kv_smem, val_cache, block_table, seq_idx,
             tile_start, tile_end, kv_head,
             block_size, num_kv_heads, max_blocks_per_seq,
             tid, NUM_THREADS);
-        // cp.async is in flight -- don't wait yet
 
         // ==============================================================
         // Step 4: Online softmax (thread 0, overlapped with V load)
         // ==============================================================
         if (tid == 0) {
-            // Find tile max
             float tile_max = -FLT_MAX;
             for (int n = 0; n < tile_len; n++)
                 tile_max = fmaxf(tile_max, p_smem[n]);
 
             float new_max = fmaxf(rowmax, tile_max);
 
-            // Exponentiate scores and sum
             float tile_sum = 0.0f;
             for (int n = 0; n < tile_len; n++) {
                 float p = __expf(p_smem[n] - new_max);
                 p_smem[n] = p;
                 tile_sum += p;
             }
-            // Zero out invalid positions so P@V loop can run full BLOCK_KV
             for (int n = tile_len; n < BLOCK_KV; n++)
                 p_smem[n] = 0.0f;
 
-            // Store metadata for other threads
             p_smem[BLOCK_KV]     = new_max;
             p_smem[BLOCK_KV + 1] = tile_sum;
         }
 
-        // Wait for V load + softmax to complete
         cp_async_wait_all();
         __syncthreads();
 
@@ -270,15 +295,13 @@ tiled_split_kv_partial_paged(
             rowmax  = tile_new_max;
         }
 
-        // P@V: each thread computes one output dimension
         if (tid < HEAD_DIM) {
             const int d = tid;
             float pv_sum = 0.0f;
 
-            // Full BLOCK_KV loop -- invalid positions have p=0 and v=0
             #pragma unroll 16
             for (int n = 0; n < BLOCK_KV; n++) {
-                pv_sum += p_smem[n] * __bfloat162float(kv_smem[n * HEAD_DIM + d]);
+                pv_sum += p_smem[n] * kv_to_float(kv_smem[n * HEAD_DIM + d]);
             }
             o_val += pv_sum;
         }
@@ -286,10 +309,15 @@ tiled_split_kv_partial_paged(
     }  // end tile loop
 
     // ==============================================================
-    // Normalize and write partial results
+    // Normalize, apply v_scale, and write partial results
     // ==============================================================
     if (rowsum > 0.0f)
         o_val /= rowsum;
+
+    // v_scale: dequantize V contribution (1.0 for BF16, actual scale for FP8)
+    if constexpr (FP8_KV) {
+        o_val *= v_scale;
+    }
 
     if (tid < HEAD_DIM)
         partial_O[split_idx * total_heads * HEAD_DIM + head_linear * HEAD_DIM + tid] = o_val;
@@ -318,14 +346,12 @@ __global__ void split_kv_reduce_v2(
 
     if (head_linear >= total_heads || tid >= HEAD_DIM) return;
 
-    // Find global max LSE across splits
     float max_lse = -FLT_MAX;
     for (int s = 0; s < num_splits; s++) {
         float lse = partial_lse[s * total_heads + head_linear];
         max_lse = fmaxf(max_lse, lse);
     }
 
-    // Weighted combination
     float sum_exp = 0.0f;
     float sum_val = 0.0f;
     for (int s = 0; s < num_splits; s++) {
@@ -341,8 +367,94 @@ __global__ void split_kv_reduce_v2(
 
 
 // ============================================================================
-// Host-callable launcher (same signature as v1 for drop-in replacement)
+// Common launcher logic (templated on FP8_KV)
 // ============================================================================
+template <bool FP8_KV>
+static void launch_decode(
+    const __nv_bfloat16* Q,
+    const kv_dtype_t<FP8_KV>* key_cache,
+    const kv_dtype_t<FP8_KV>* val_cache,
+    const int* block_table,
+    const int* seq_lens,
+    __nv_bfloat16* O,
+    float* partial_O,
+    float* partial_lse,
+    int batch_size,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    int max_seq_len,
+    int block_size,
+    int max_blocks_per_seq,
+    int max_splits,
+    float k_scale,
+    float v_scale,
+    cudaStream_t stream
+) {
+    // Absorb k_scale into softmax scale
+    float scale = (1.0f / sqrtf((float)head_dim)) * k_scale;
+
+    // Adaptive split count
+    int num_splits;
+    if (max_seq_len <= 256)        num_splits = 1;
+    else if (max_seq_len <= 1024)  num_splits = 4;
+    else if (max_seq_len <= 4096)  num_splits = 8;
+    else if (max_seq_len <= 16384) num_splits = 16;
+    else                           num_splits = 32;
+    if (num_splits > max_splits)   num_splits = max_splits;
+
+    int kv_per_split = (max_seq_len + num_splits - 1) / num_splits;
+    int total_heads = batch_size * num_q_heads;
+
+    dim3 grid1(num_splits, batch_size, num_q_heads);
+
+    if (head_dim == 256) {
+        constexpr int HD = 256;
+        constexpr int BKV = 128;
+        int smem_bytes = HD * (int)sizeof(float)
+                       + BKV * HD * (int)sizeof(kv_dtype_t<FP8_KV>)
+                       + (BKV + 4) * (int)sizeof(float);
+
+        auto kernel = tiled_split_kv_partial_paged<HD, BKV, FP8_KV>;
+        cudaFuncSetAttribute(kernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
+        kernel<<<grid1, HD, smem_bytes, stream>>>(
+            Q, key_cache, val_cache, block_table, seq_lens,
+            partial_O, partial_lse,
+            num_q_heads, num_kv_heads, block_size, max_blocks_per_seq,
+            scale, v_scale, kv_per_split);
+
+        dim3 grid2(total_heads);
+        split_kv_reduce_v2<HD><<<grid2, HD, 0, stream>>>(
+            partial_O, partial_lse, O, num_splits, total_heads);
+    } else {
+        constexpr int HD = 128;
+        constexpr int BKV = 128;
+        int smem_bytes = HD * (int)sizeof(float)
+                       + BKV * HD * (int)sizeof(kv_dtype_t<FP8_KV>)
+                       + (BKV + 4) * (int)sizeof(float);
+
+        auto kernel = tiled_split_kv_partial_paged<HD, BKV, FP8_KV>;
+        cudaFuncSetAttribute(kernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
+        kernel<<<grid1, HD, smem_bytes, stream>>>(
+            Q, key_cache, val_cache, block_table, seq_lens,
+            partial_O, partial_lse,
+            num_q_heads, num_kv_heads, block_size, max_blocks_per_seq,
+            scale, v_scale, kv_per_split);
+
+        dim3 grid2(total_heads);
+        split_kv_reduce_v2<HD><<<grid2, HD, 0, stream>>>(
+            partial_O, partial_lse, O, num_splits, total_heads);
+    }
+}
+
+
+// ============================================================================
+// Host-callable launchers (extern "C" for torch extension)
+// ============================================================================
+
+// BF16 launcher (backward compatible — same signature as before + k_scale/v_scale)
 extern "C" void sm120_flash_decode_paged_launch(
     const __nv_bfloat16* Q,
     const __nv_bfloat16* key_cache,
@@ -362,59 +474,40 @@ extern "C" void sm120_flash_decode_paged_launch(
     int max_splits,
     cudaStream_t stream
 ) {
-    float scale = 1.0f / sqrtf((float)head_dim);
+    launch_decode<false>(
+        Q, key_cache, val_cache, block_table, seq_lens, O,
+        partial_O, partial_lse,
+        batch_size, num_q_heads, num_kv_heads, head_dim,
+        max_seq_len, block_size, max_blocks_per_seq, max_splits,
+        1.0f, 1.0f, stream);
+}
 
-    // Adaptive split count
-    int num_splits;
-    if (max_seq_len <= 256)       num_splits = 1;
-    else if (max_seq_len <= 1024) num_splits = 4;
-    else if (max_seq_len <= 4096) num_splits = 8;
-    else if (max_seq_len <= 16384) num_splits = 16;
-    else                          num_splits = 32;
-    if (num_splits > max_splits)  num_splits = max_splits;
-
-    int kv_per_split = (max_seq_len + num_splits - 1) / num_splits;
-    int total_heads = batch_size * num_q_heads;
-
-    dim3 grid1(num_splits, batch_size, num_q_heads);
-
-    if (head_dim == 256) {
-        constexpr int BKV = 128;
-        constexpr int HD = 256;
-        int smem_bytes = HD * sizeof(float)
-                       + BKV * HD * sizeof(__nv_bfloat16)
-                       + (BKV + 4) * sizeof(float);
-
-        auto kernel = tiled_split_kv_partial_paged<HD, BKV>;
-        cudaFuncSetAttribute(kernel,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
-        kernel<<<grid1, HD, smem_bytes, stream>>>(
-            Q, key_cache, val_cache, block_table, seq_lens,
-            partial_O, partial_lse,
-            num_q_heads, num_kv_heads, block_size, max_blocks_per_seq,
-            scale, kv_per_split);
-
-        dim3 grid2(total_heads);
-        split_kv_reduce_v2<HD><<<grid2, HD, 0, stream>>>(
-            partial_O, partial_lse, O, num_splits, total_heads);
-    } else {
-        constexpr int BKV = 128;
-        constexpr int HD = 128;
-        int smem_bytes = HD * sizeof(float)
-                       + BKV * HD * sizeof(__nv_bfloat16)
-                       + (BKV + 4) * sizeof(float);
-
-        auto kernel = tiled_split_kv_partial_paged<HD, BKV>;
-        cudaFuncSetAttribute(kernel,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
-        kernel<<<grid1, HD, smem_bytes, stream>>>(
-            Q, key_cache, val_cache, block_table, seq_lens,
-            partial_O, partial_lse,
-            num_q_heads, num_kv_heads, block_size, max_blocks_per_seq,
-            scale, kv_per_split);
-
-        dim3 grid2(total_heads);
-        split_kv_reduce_v2<HD><<<grid2, HD, 0, stream>>>(
-            partial_O, partial_lse, O, num_splits, total_heads);
-    }
+// FP8 E4M3 launcher
+extern "C" void sm120_flash_decode_paged_fp8_launch(
+    const __nv_bfloat16* Q,
+    const __nv_fp8_e4m3* key_cache,
+    const __nv_fp8_e4m3* val_cache,
+    const int* block_table,
+    const int* seq_lens,
+    __nv_bfloat16* O,
+    float* partial_O,
+    float* partial_lse,
+    int batch_size,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    int max_seq_len,
+    int block_size,
+    int max_blocks_per_seq,
+    int max_splits,
+    float k_scale,
+    float v_scale,
+    cudaStream_t stream
+) {
+    launch_decode<true>(
+        Q, key_cache, val_cache, block_table, seq_lens, O,
+        partial_O, partial_lse,
+        batch_size, num_q_heads, num_kv_heads, head_dim,
+        max_seq_len, block_size, max_blocks_per_seq, max_splits,
+        k_scale, v_scale, stream);
 }
