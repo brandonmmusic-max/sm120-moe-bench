@@ -1,0 +1,67 @@
+{
+  "metadata": {
+    "engine": "vllm",
+    "model": "qwen3.5-397b-nvfp4",
+    "server": "localhost:9200",
+    "timestamp": "2026-03-26T01:27:59.142993",
+    "duration_per_test": 60.0,
+    "max_tokens": 8192,
+    "max_total_tokens": 0,
+    "concurrency_levels": [
+      1
+    ],
+    "context_lengths": [
+      0
+    ]
+  },
+  "prefill": {
+    "8192": {
+      "ttft_seconds": 0.729,
+      "tok_per_sec": 12935.0
+    },
+    "16384": {
+      "ttft_seconds": 1.384,
+      "tok_per_sec": 12718.0
+    },
+    "32768": {
+      "ttft_seconds": 2.832,
+      "tok_per_sec": 11974.0
+    },
+    "65536": {
+      "ttft_seconds": 6.218,
+      "tok_per_sec": 10705.0
+    },
+    "131072": {
+      "ttft_seconds": 14.828,
+      "tok_per_sec": 8896.0
+    }
+  },
+  "results": [
+    {
+      "concurrency": 1,
+      "context_tokens": 0,
+      "aggregate_tps": 151.1535765583752,
+      "per_request_avg_tps": 151.1535765583752,
+      "ttft_avg": 0.08779041998786852,
+      "ttft_p50": 0.08779041998786852,
+      "ttft_p99": 0.08779041998786852,
+      "total_tokens": 766,
+      "wall_time": 94.03492466098396,
+      "num_completed": 1,
+      "num_errors": 0,
+      "server_gen_throughput": 151.1535765583752,
+      "server_utilization": 0.020194465220643276,
+      "server_spec_accept_rate": 1411.0,
+      "avg_running_reqs": 1.8,
+      "max_running_reqs": 2,
+      "avg_queue_reqs": 0,
+      "max_queue_reqs": 0,
+      "queue_fraction": 0.0
+    }
+  ],
+  "summary_table": {
+    "0": {
+      "1": 151.1535765583752
+    }
+  }
+}

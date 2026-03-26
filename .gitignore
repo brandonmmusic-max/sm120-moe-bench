@@ -1,6 +1,8 @@
 # Compiled binaries
 fused-moe/csrc/verdict_fused_cooperative_mt
 fused-moe/csrc/verdict_*_test
+fused-moe/verdict_*
+fused-moe/bench_p2p_allreduce
 *.o
 *.so
 
