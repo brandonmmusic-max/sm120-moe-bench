@@ -11,8 +11,11 @@ from torch.utils.cpp_extension import load_inline
 
 _CSRC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "csrc")
 
-# Read the CUDA source
-with open(os.path.join(_CSRC_DIR, "sm120_flash_decode_paged.cu"), "r") as f:
+# Read the CUDA source (v2: tiled vectorized with cp.async bulk loads)
+_V2_PATH = os.path.join(_CSRC_DIR, "sm120_flash_decode_v2_paged.cu")
+_V1_PATH = os.path.join(_CSRC_DIR, "sm120_flash_decode_paged.cu")
+_KERNEL_PATH = _V2_PATH if os.path.exists(_V2_PATH) else _V1_PATH
+with open(_KERNEL_PATH, "r") as f:
     _CUDA_SOURCE = f.read()
 
 # C++ wrapper that calls the extern "C" launcher via torch tensors
@@ -138,19 +141,22 @@ def sm120_flash_decode_paged(
     seq_lens: torch.Tensor,     # [num_seqs] int32
     output: torch.Tensor | None = None,
     workspace: SM120FlashDecodeWorkspace | None = None,
+    max_seq_len: int | None = None,
 ) -> torch.Tensor:
     """
     SM120-native flash decode attention with paged KV cache.
 
     For decode: query has shape [batch, num_q_heads, head_dim] (one token per seq).
     Output shape: [batch, num_q_heads, head_dim].
+    Pass max_seq_len to avoid GPU->CPU sync from seq_lens.max().item().
     """
     mod = _get_module()
 
     batch_size = query.shape[0]
     num_q_heads = query.shape[1]
     head_dim = query.shape[2]
-    max_seq_len = int(seq_lens.max().item())
+    if max_seq_len is None:
+        max_seq_len = int(seq_lens.max().item())
 
     if output is None:
         output = torch.empty_like(query)

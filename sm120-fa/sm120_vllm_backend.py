@@ -183,6 +183,8 @@ class SM120FlashAttentionImpl(FlashAttentionImpl):
         )
 
         # Call SM120 decode kernel
+        # Pass max_seq_len to avoid GPU->CPU sync from seq_lens.max().item()
+        max_sl = getattr(attn_metadata, 'max_seq_len', None)
         result = ext.sm120_flash_decode_paged(
             query=q,
             key_cache=key_cache,
@@ -191,6 +193,7 @@ class SM120FlashAttentionImpl(FlashAttentionImpl):
             seq_lens=attn_metadata.seq_lens,
             output=output[:num_tokens],
             workspace=workspace,
+            max_seq_len=max_sl,
         )
 
         return output
