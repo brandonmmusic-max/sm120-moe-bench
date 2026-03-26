@@ -1,0 +1,39 @@
+{
+  "sprint": 12,
+  "date": "2026-03-26",
+  "changes": [
+    "Removed -use_fast_math compiler flag (IEEE-compliant expf/divf in SiLU)",
+    "Replaced atomicAdd with deterministic per-pair reduction"
+  ],
+  "mtp_acceptance": {
+    "overall": 69.6,
+    "position_0": 86.9,
+    "position_1": 68.9,
+    "position_2": 53.0,
+    "draft_tokens": 7959,
+    "accepted_tokens": 5540,
+    "num_tokens_generated": 8192
+  },
+  "baselines": {
+    "sprint9_verdict": {
+      "overall": 65.9,
+      "pos0": 84.9,
+      "pos1": 64.9,
+      "pos2": 48.1
+    },
+    "flashinfer_cutlass": {
+      "overall": 69.9,
+      "pos0": 87.0,
+      "pos1": 69.8,
+      "pos2": 52.8
+    },
+    "vllm_cutlass": {
+      "overall": 69.2,
+      "pos0": 87.0,
+      "pos1": 69.1,
+      "pos2": 52.2
+    }
+  },
+  "throughput_toks": 159.8,
+  "correctness": "4/4 PASS"
+}

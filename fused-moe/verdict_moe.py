@@ -68,7 +68,11 @@ _CUDA_FLAGS = [
     "-gencode=arch=compute_120a,code=sm_120a",
     "-O2",
     "--expt-relaxed-constexpr",
-    "-use_fast_math",
+    # NOTE: -use_fast_math deliberately omitted.
+    # It makes expf/divf use ~2 ULP approximations, which compounds through
+    # 60 MoE layers (SiLU, scale divisions) and shifts logits enough to flip
+    # argmax ~4% of the time under strict MTP rejection sampling.
+    # The MMA instructions (PTX inline asm) are unaffected by this flag.
 ]
 
 
@@ -309,6 +313,15 @@ class VerdictMoEExperts(mk.FusedMoEExpertsModular):
             self._buf_inter_sf = torch.empty(
                 max_active * (N_half // SF_BLOCK),
                 dtype=torch.uint8, device=device,
+            )
+            # Per-pair GEMM2 output for deterministic reduction
+            # (replaces non-deterministic atomicAdd accumulation)
+            # Sized for max_pairs (MAX_M_KERNEL * max_topk = 40), NOT max_active
+            MAX_M_KERNEL = 4  # MTP=3 → M=4 max for fused path
+            max_pairs = MAX_M_KERNEL * max_topk  # 40
+            self._buf_pair_output_f32 = torch.empty(
+                max_pairs * K,
+                dtype=torch.float32, device=device,
             )
             # Atomic barrier counter for fused cooperative kernel
             self._buf_barrier = torch.zeros(
@@ -586,6 +599,7 @@ class VerdictMoEExperts(mk.FusedMoEExpertsModular):
             input_sf = self._buf_input_sf[:m * sf_cols]
             inter_fp4 = self._buf_inter_fp4[:num_pairs * n_half_packed]
             inter_sf = self._buf_inter_sf[:num_pairs * n_half_sf]
+            pair_output_f32 = self._buf_pair_output_f32[:num_pairs * k]
 
             ext_coop.forward(
                 hidden_states.contiguous(),
@@ -600,6 +614,7 @@ class VerdictMoEExperts(mk.FusedMoEExpertsModular):
                 token_ids_flat,     # [num_pairs] int32
                 wts_for_kernel,     # [num_pairs] float32
                 output_f32,
+                pair_output_f32,
                 input_fp4,
                 input_sf,
                 self._buf_partials,
@@ -614,6 +629,7 @@ class VerdictMoEExperts(mk.FusedMoEExpertsModular):
             input_sf = self._buf_input_sf[:sf_cols]
             inter_fp4 = self._buf_inter_fp4[:topk * n_half_packed]
             inter_sf = self._buf_inter_sf[:topk * n_half_sf]
+            pair_output_f32_m1 = self._buf_pair_output_f32[:topk * k]
 
             # M=1 token_ids: all zeros (single token → token_id=0)
             m1_token_ids = self._buf_token_ids[:topk]
@@ -638,6 +654,7 @@ class VerdictMoEExperts(mk.FusedMoEExpertsModular):
                     m1_token_ids,
                     tok_wts,
                     output_f32[:k],
+                    pair_output_f32_m1,
                     input_fp4,
                     input_sf,
                     self._buf_partials,

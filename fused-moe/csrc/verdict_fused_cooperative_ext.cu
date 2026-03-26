@@ -141,6 +141,7 @@ verdict_fused_independent_mt(
     const float*   __restrict__ expert_wts,         // [num_pairs]
     __nv_bfloat16* __restrict__ output_bf16,        // [M, K]
     float*         __restrict__ output_f32,         // [M, K]
+    float*         __restrict__ pair_output_f32,    // [num_pairs, K] per-pair GEMM2 output
     uint8_t*       __restrict__ input_fp4,          // [M, K/2]
     uint8_t*       __restrict__ input_sf,           // [M, K/16]
     float*         __restrict__ partials,           // [num_pairs * num_tiles * PARTIALS_PER_CTA]
@@ -185,9 +186,9 @@ verdict_fused_independent_mt(
         const int global_tid = blockIdx.x * BLOCK_SIZE + tid;
         const int total_threads = gridDim.x * BLOCK_SIZE;
 
-        // Zero output_f32
-        for (int i = global_tid; i < M * HIDDEN; i += total_threads)
-            output_f32[i] = 0.0f;
+        // Zero pair_output_f32 (per-pair GEMM2 outputs, summed in epilogue)
+        for (int i = global_tid; i < num_pairs * HIDDEN; i += total_threads)
+            pair_output_f32[i] = 0.0f;
 
         // BF16→NVFP4 for all M tokens
         constexpr int num_sf_groups = HIDDEN / SF_BLOCK;  // 256 per token
@@ -444,13 +445,13 @@ verdict_fused_independent_mt(
                 __syncthreads();
             }
 
-            // Scatter with per-token routing weight × alpha2
+            // Write per-pair GEMM2 output (deterministic, no atomicAdd)
             if (lane_id < 4) {
                 float scale = wt * alpha2;
                 int j0 = j_start + warp_id * 8 + lane_id;
                 int j1 = j0 + 4;
-                if (j0 < HIDDEN) atomicAdd(&output_f32[token_id * HIDDEN + j0], scale * p2_acc[0]);
-                if (j1 < HIDDEN) atomicAdd(&output_f32[token_id * HIDDEN + j1], scale * p2_acc[1]);
+                if (j0 < HIDDEN) pair_output_f32[pair_idx * HIDDEN + j0] = scale * p2_acc[0];
+                if (j1 < HIDDEN) pair_output_f32[pair_idx * HIDDEN + j1] = scale * p2_acc[1];
             }
         }
     }
@@ -458,13 +459,26 @@ verdict_fused_independent_mt(
     grid_barrier_atomic(barrier_counter, total_ctas, 3);
 
     // ================================================================
-    // EPILOGUE: F32 → BF16 for ALL M tokens
+    // EPILOGUE: Deterministic reduction + F32 → BF16 for ALL M tokens
+    //
+    // Sum per-pair outputs in fixed order (pair 0, 1, ..., topk-1) for
+    // each token. Eliminates non-deterministic atomicAdd rounding that
+    // caused ~1-2% MTP acceptance loss under strict rejection sampling.
     // ================================================================
     {
         const int global_tid = blockIdx.x * BLOCK_SIZE + tid;
         const int total_threads = gridDim.x * BLOCK_SIZE;
-        for (int i = global_tid; i < M * HIDDEN; i += total_threads)
-            output_bf16[i] = __float2bfloat16(output_f32[i]);
+        const int topk = num_pairs / M;
+        for (int i = global_tid; i < M * HIDDEN; i += total_threads) {
+            int token = i / HIDDEN;
+            int col   = i % HIDDEN;
+            int pair_start = token * topk;
+            float sum = 0.0f;
+            for (int p = 0; p < topk; p++) {
+                sum += pair_output_f32[(pair_start + p) * HIDDEN + col];
+            }
+            output_bf16[i] = __float2bfloat16(sum);
+        }
     }
 }
 
@@ -486,7 +500,8 @@ void verdict_cooperative_forward(
     torch::Tensor expert_ids,     // [num_pairs] int32
     torch::Tensor token_ids,      // [num_pairs] int32
     torch::Tensor expert_weights, // [num_pairs] float32
-    torch::Tensor output_f32,     // [M * K] float32
+    torch::Tensor output_f32,     // [M * K] float32 (unused, kept for compat)
+    torch::Tensor pair_output_f32,// [num_pairs * K] float32 — per-pair GEMM2 output
     torch::Tensor input_fp4_buf,  // [M * K/2] uint8
     torch::Tensor input_sf_buf,   // [M * K/16] uint8
     torch::Tensor partials_buf,   // [num_pairs * num_tiles * 128] float32
@@ -536,6 +551,7 @@ void verdict_cooperative_forward(
         reinterpret_cast<const float*>(expert_weights.data_ptr()),
         reinterpret_cast<__nv_bfloat16*>(output.data_ptr()),
         reinterpret_cast<float*>(output_f32.data_ptr()),
+        reinterpret_cast<float*>(pair_output_f32.data_ptr()),
         reinterpret_cast<uint8_t*>(input_fp4_buf.data_ptr()),
         reinterpret_cast<uint8_t*>(input_sf_buf.data_ptr()),
         reinterpret_cast<float*>(partials_buf.data_ptr()),
