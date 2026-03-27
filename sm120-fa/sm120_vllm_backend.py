@@ -98,7 +98,9 @@ class SM120MetadataBuilder(FlashInferMetadataBuilder):
 
     @classmethod
     def get_cudagraph_support(cls, vllm_config, kv_cache_spec) -> AttentionCGSupport:
-        return AttentionCGSupport.UNIFORM_BATCH
+        # UNIFORM_BATCH enables FULL+PIECEWISE but hangs on verdict-sprint11
+        # Use UNIFORM_SINGLE_TOKEN_DECODE (PIECEWISE only) for now
+        return AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
 
     def build(self, common_prefix_len: int, common_attn_metadata: CommonAttentionMetadata, fast_build: bool = False) -> FlashInferMetadata:
         metadata = super().build(common_prefix_len, common_attn_metadata, fast_build=fast_build)
@@ -159,12 +161,6 @@ class SM120FlashInferImpl(FlashInferImpl):
         if not self._sm120_init_attempted:
             self._try_init_sm120(query.device)
 
-        # DEBUG: log dispatch info
-        if hasattr(attn_metadata, '_debug_logged') is False or not getattr(attn_metadata, '_debug_logged', False):
-            logger.info("SM120 dispatch: num_decodes=%d, num_decode_tokens=%d, num_prefills=%d, num_prefill_tokens=%d",
-                        attn_metadata.num_decodes, attn_metadata.num_decode_tokens,
-                        attn_metadata.num_prefills, attn_metadata.num_prefill_tokens)
-
         # Dispatch decode to SM120 kernel when conditions are met
         can_use_sm120_decode = (
             self._sm120_decode_available
@@ -183,9 +179,28 @@ class SM120FlashInferImpl(FlashInferImpl):
                 layer, query, kv_cache, attn_metadata, output
             )
 
-        # MTP verify falls through to FlashInfer — repeat_interleave is not CUDA-graph-safe.
-        # Sprint 14 showed 68% MTP acceptance with SM120 decode + FlashInfer verify.
-        # Fall through to FlashInfer for everything else (prefill, MTP verify, mixed, etc.)
+        # MTP verification: classified as "prefill" with small token count
+        # Route through SM120 decode kernel for identical numerics with draft path
+        can_use_sm120_mtp_verify = (
+            self._sm120_decode_available
+            and attn_metadata.num_prefills > 0
+            and attn_metadata.num_prefill_tokens <= attn_metadata.num_prefills * 8  # MTP verify: ≤8 tokens per req
+            and attn_metadata.num_decodes == 0
+            and self.attn_type == AttentionType.DECODER
+            and not attn_metadata.use_cascade
+            and self.alibi_slopes is None
+            and self.sliding_window == (-1, -1)
+            and hasattr(attn_metadata, '_sm120_block_tables')
+            and attn_metadata._sm120_block_tables is not None
+        )
+
+        # MTP verify path disabled — hangs on verdict-sprint11
+        # if can_use_sm120_mtp_verify:
+        #     return self._forward_sm120_mtp_verify(
+        #         layer, query, kv_cache, attn_metadata, output
+        #     )
+
+        # Absolute fallback — should never hit this for decoder attention
         return super().forward(
             layer, query, key, value, kv_cache, attn_metadata,
             output, output_scale, output_block_scale,
@@ -205,6 +220,19 @@ class SM120FlashInferImpl(FlashInferImpl):
         num_decode_tokens = attn_metadata.num_decode_tokens
         num_decodes = attn_metadata.num_decodes
         key_cache, value_cache = kv_cache[:, 0], kv_cache[:, 1]
+
+        # Debug: log shapes/strides on first call
+        if not hasattr(self, '_sm120_debug_logged'):
+            self._sm120_debug_logged = True
+            logger.info(
+                "SM120 decode dispatch: kv_cache.shape=%s kv_cache.stride=%s "
+                "key_cache.shape=%s key_cache.stride=%s key_cache.dtype=%s "
+                "block_tables.shape=%s seq_lens=%s num_decode_tokens=%d",
+                kv_cache.shape, kv_cache.stride(),
+                key_cache.shape, key_cache.stride(), key_cache.dtype,
+                decode_meta.block_tables.shape, decode_meta.seq_lens[:min(4, num_decodes)],
+                num_decode_tokens,
+            )
 
         # Get KV dequant scales from layer (default 1.0 for BF16)
         k_scale = getattr(layer, '_k_scale_float', 1.0)
@@ -287,42 +315,50 @@ class SM120FlashInferImpl(FlashInferImpl):
     ) -> torch.Tensor:
         """Handle MTP verification through SM120 decode kernel.
 
-        MTP verify is classified as prefill (num_prefills>0, small token count).
-        We call the decode kernel once per query token to match draft numerics.
+        MTP verify is classified as prefill with small token count (e.g., 4 tokens
+        for MTP=3). We treat each query token as an independent Sq=1 decode call
+        with incrementing seq_lens for causal masking.
 
-        CUDA graph safe: no .item() calls, fixed loop count, tensor-only ops.
+        For single-user MTP=3: 1 request, 4 query tokens, same block_table.
+        CUDA graph safe: expand() not copy, pre-built offset tensor.
         """
         ext = _get_sm120_decode()
         num_tokens = attn_metadata.num_prefill_tokens
-        num_prefills = attn_metadata.num_prefills
         key_cache, value_cache = kv_cache[:, 0], kv_cache[:, 1]
 
         k_scale = getattr(layer, '_k_scale_float', 1.0)
         v_scale = getattr(layer, '_v_scale_float', 1.0)
 
-        # Use stored metadata from SM120MetadataBuilder.build()
-        # seq_lens: [num_reqs], block_tables: [num_reqs, max_blocks]
-        # query_start_loc: [num_reqs + 1] cumulative query token offsets
-        seq_lens_kv = attn_metadata._sm120_seq_lens  # [num_reqs]
-        block_tables = attn_metadata._sm120_block_tables  # [num_reqs, max_blocks]
-        query_start_loc = attn_metadata._sm120_query_start_loc  # [num_reqs + 1]
+        seq_lens_kv = attn_metadata._sm120_seq_lens       # [num_reqs]
+        block_tables = attn_metadata._sm120_block_tables   # [num_reqs, max_blocks]
         max_seq_len = attn_metadata._sm120_max_seq_len
 
-        # For MTP verify: num_prefills requests, each with some query tokens.
-        # Token layout: [req0_q0, req0_q1, ..., req0_qN, req1_q0, ...]
-        # We process ALL tokens as individual Sq=1 decode calls.
-        # Each token at position i within its request sees seq_lens_kv + i KV entries.
+        # For MTP verify: expand block_table to num_tokens rows
+        # Single request: block_tables[0:1] → expand to [num_tokens, max_blocks]
+        # Multi request: repeat each request's row by its query count
+        # expand() is a view (no copy, CUDA-graph-safe)
+        # Build per-token block_tables and seq_lens for all requests
+        # Works for 1 or N concurrent users. All tensor ops, CUDA-graph-safe.
+        query_start_loc = attn_metadata._sm120_query_start_loc  # [num_reqs + 1]
+        q_lens = query_start_loc[1:] - query_start_loc[:-1]    # [num_reqs]
 
-        # Expand block_tables: [num_prefills, max_blocks] -> [num_tokens, max_blocks]
-        q_lens = query_start_loc[1:] - query_start_loc[:-1]  # [num_reqs]
-        bt_expanded = block_tables.repeat_interleave(q_lens, dim=0)
+        # Expand block_tables: repeat each request's row by its query token count
+        # For 1 user with 4 tokens: [1, max_blocks] → [4, max_blocks]
+        # For 2 users with 4 tokens each: [2, max_blocks] → [8, max_blocks]
+        bt_expanded = block_tables.repeat_interleave(q_lens, dim=0)  # [num_tokens, max_blocks]
 
         # Build per-token seq_lens with causal offset
-        global_idx = torch.arange(num_tokens, dtype=seq_lens_kv.dtype, device=seq_lens_kv.device)
-        req_starts = query_start_loc[:-1].repeat_interleave(q_lens)
-        offsets = global_idx - req_starts
+        # Token i within request r sees seq_lens_kv[r] + offset_within_request
+        # Ensure offset buffer exists and is large enough
+        if not hasattr(self, '_mtp_offsets') or self._mtp_offsets.size(0) < num_tokens:
+            self._mtp_offsets = torch.arange(
+                max(num_tokens, 16), dtype=seq_lens_kv.dtype, device=seq_lens_kv.device
+            )
+        global_idx = self._mtp_offsets[:num_tokens]
+        req_starts = query_start_loc[:-1].repeat_interleave(q_lens)  # [num_tokens]
+        offsets = global_idx - req_starts  # per-token offset within its request
 
-        sl_expanded = seq_lens_kv.repeat_interleave(q_lens) + offsets
+        sl_expanded = seq_lens_kv.repeat_interleave(q_lens) + offsets  # [num_tokens]
 
         max_sl = max_seq_len + num_tokens
 

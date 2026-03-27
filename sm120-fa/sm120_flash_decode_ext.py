@@ -89,10 +89,10 @@ std::vector<torch::Tensor> sm120_flash_decode(
     int batch_size = query.size(0);
     int num_q_heads = query.size(1);
     int head_dim = query.size(2);
-    // Logical shape: [num_blocks, block_size, num_kv_heads, head_dim]
-    // Physical layout may be HND (strides permuted) — kernel handles via kv_block_stride
-    int block_size = key_cache.size(1);
-    int num_kv_heads = key_cache.size(2);
+    // Physical layout is HND: [num_blocks, num_kv_heads, block_size, head_dim]
+    // after kv_cache[:, 0] on vLLM Blackwell (stride_order HND)
+    int num_kv_heads = key_cache.size(1);
+    int block_size = key_cache.size(2);
     int max_blocks_per_seq = block_table.size(1);
     int max_splits = partial_O.size(0);
 

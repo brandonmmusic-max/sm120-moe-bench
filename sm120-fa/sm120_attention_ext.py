@@ -134,12 +134,11 @@ def sm120_prefill(
     """
     SM120 prefill attention with paged KV cache.
 
-    Gathers paged KV into contiguous buffers, then runs MMA prefill kernel.
+    Gathers paged KV into contiguous buffers, then runs prefill attention.
+    Uses SM120 MMA kernel for HEAD_DIM=128, PyTorch SDPA for other sizes.
     Input Q is [query_len, num_q_heads, head_dim] (vLLM token-first layout).
     Output is same shape as Q.
     """
-    ext = _get_prefill_ext()
-
     num_q_heads = query.shape[1]
     num_kv_heads = key_cache.shape[2]
     head_dim = query.shape[2]
@@ -154,29 +153,50 @@ def sm120_prefill(
         k_scale=k_scale, v_scale=v_scale, is_key=False,
     )
 
-    # Transpose Q: [query_len, Hq, HD] → [Hq, query_len, HD]
-    q_transposed = query[:query_len].permute(1, 0, 2).contiguous()
+    if head_dim == 128:
+        # SM120 MMA prefill kernel (HEAD_DIM=128 only)
+        ext = _get_prefill_ext()
 
-    # Allocate output in kernel layout: [Hq, query_len, HD]
-    o_kernel = torch.empty(num_q_heads, query_len, head_dim,
-                           dtype=torch.bfloat16, device=query.device)
+        # Transpose Q: [query_len, Hq, HD] → [Hq, query_len, HD]
+        q_transposed = query[:query_len].permute(1, 0, 2).contiguous()
 
-    # Run prefill kernel
-    ext.sm120_flash_prefill_forward(
-        query=q_transposed,
-        key=k_contig,
-        value=v_contig,
-        output=o_kernel,
-        batch=1,
-        Hq=num_q_heads,
-        Hkv=num_kv_heads,
-        Sq=query_len,
-        Skv=seq_len,
-        causal=causal,
-    )
+        # Allocate output in kernel layout: [Hq, query_len, HD]
+        o_kernel = torch.empty(num_q_heads, query_len, head_dim,
+                               dtype=torch.bfloat16, device=query.device)
 
-    # Transpose output back: [Hq, query_len, HD] → [query_len, Hq, HD]
-    o_result = o_kernel.permute(1, 0, 2).contiguous()
+        ext.sm120_flash_prefill_forward(
+            query=q_transposed,
+            key=k_contig,
+            value=v_contig,
+            output=o_kernel,
+            batch=1,
+            Hq=num_q_heads,
+            Hkv=num_kv_heads,
+            Sq=query_len,
+            Skv=seq_len,
+            causal=causal,
+        )
+
+        o_result = o_kernel.permute(1, 0, 2).contiguous()
+    else:
+        # Fallback: PyTorch SDPA for HEAD_DIM != 128 (e.g., 256)
+        # No FlashInfer dependency — uses cuDNN/math backend
+        import torch.nn.functional as F
+
+        # GQA: expand KV heads to match Q heads
+        gqa_ratio = num_q_heads // num_kv_heads
+
+        # Q: [query_len, Hq, HD] → [1, Hq, query_len, HD]
+        q = query[:query_len].permute(1, 0, 2).unsqueeze(0).to(torch.float32)
+        # K: [Hkv, seq_len, HD] → [1, Hq, seq_len, HD] (expand for GQA)
+        k = k_contig.unsqueeze(0).to(torch.float32)
+        v = v_contig.unsqueeze(0).to(torch.float32)
+        if gqa_ratio > 1:
+            k = k.repeat_interleave(gqa_ratio, dim=1)
+            v = v.repeat_interleave(gqa_ratio, dim=1)
+
+        o = F.scaled_dot_product_attention(q, k, v, is_causal=causal)
+        o_result = o.squeeze(0).permute(1, 0, 2).contiguous().to(torch.bfloat16)
 
     # Write to pre-allocated output if provided
     if output is not None:

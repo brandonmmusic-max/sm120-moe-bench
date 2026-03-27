@@ -94,8 +94,9 @@ class AttentionCGSupport(enum.IntEnum):
 class SM120MetadataBuilder(AttentionMetadataBuilderBase):
     """Builds SM120AttentionMetadata from CommonAttentionMetadata."""
 
-    def __init__(self, kv_cache_spec, vllm_config, device):
+    def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
         self.kv_cache_spec = kv_cache_spec
+        self.layer_names = layer_names
         self.vllm_config = vllm_config
         self.device = device
         self.block_size = kv_cache_spec.block_size
@@ -476,9 +477,14 @@ class SM120AttentionImpl(AttentionImplBase):
 class SM120AttentionBackend(AttentionBackend):
     """SM120-native attention backend — zero FlashInfer dependency."""
 
+    accept_output_buffer = True
+    forward_includes_kv_cache_update = False
+    supported_dtypes = [torch.bfloat16]
+    supported_kv_cache_dtypes = ["auto", "fp8", "fp8_e4m3"]
+
     @staticmethod
     def get_name() -> str:
-        return "SM120_FLASH"
+        return "FLASHINFER"
 
     @staticmethod
     def get_impl_cls() -> type:
@@ -513,50 +519,15 @@ class SM120AttentionBackend(AttentionBackend):
 
     @classmethod
     def get_supported_head_sizes(cls) -> list:
-        return [128]
+        return [128, 256]
 
     @classmethod
-    def supports_compute_capability(cls, cap) -> bool:
-        return cap.major == 12
-
-    @classmethod
-    def supports_kv_cache_dtype(cls, dtype: str) -> bool:
-        return dtype in ("auto", "fp8", "fp8_e4m3")
-
-    @classmethod
-    def supports_dtype(cls, dtype: torch.dtype) -> bool:
-        return dtype == torch.bfloat16
+    def supports_compute_capability(cls, capability) -> bool:
+        return capability.major == 12
 
     @classmethod
     def get_required_kv_cache_layout(cls):
         return None  # NHD (default)
-
-    @classmethod
-    def validate_configuration(
-        cls,
-        num_heads: int,
-        head_size: int,
-        num_kv_heads: int,
-        dtype: torch.dtype,
-        kv_cache_dtype: str,
-        block_size: int,
-        sliding_window: Optional[int] = None,
-        logits_soft_cap: Optional[float] = None,
-        attn_type: str = AttentionType.DECODER,
-    ) -> list:
-        """Return list of error strings if configuration is invalid."""
-        errors = []
-        if head_size not in cls.get_supported_head_sizes():
-            errors.append(f"SM120 backend only supports head_size={cls.get_supported_head_sizes()}, got {head_size}")
-        if dtype != torch.bfloat16:
-            errors.append(f"SM120 backend only supports bfloat16, got {dtype}")
-        if attn_type != AttentionType.DECODER:
-            errors.append(f"SM120 backend only supports decoder attention, got {attn_type}")
-        if sliding_window is not None:
-            errors.append("SM120 backend does not support sliding window attention")
-        if logits_soft_cap is not None:
-            errors.append("SM120 backend does not support logits soft capping")
-        return errors
 
     @classmethod
     def supports_sink(cls) -> bool:
