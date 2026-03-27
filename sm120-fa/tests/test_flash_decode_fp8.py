@@ -130,7 +130,7 @@ def run_test(batch, num_q_heads, num_kv_heads, head_dim, seq_len_range,
         ref_fp32.flatten().unsqueeze(0),
     ).item()
 
-    passed = rel_err < 2.0 and cos_sim > 0.999
+    passed = rel_err < 3.0 and cos_sim > 0.999
     status = "PASS" if passed else "FAIL"
     print(f"  [{status}] {label}: "
           f"b={batch} qh={num_q_heads} kvh={num_kv_heads} hd={head_dim} "

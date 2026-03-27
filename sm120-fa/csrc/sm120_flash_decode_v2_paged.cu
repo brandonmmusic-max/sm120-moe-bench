@@ -29,6 +29,26 @@
 
 #define WARP_SIZE 32
 
+// ---- PTX math intrinsics (match FlashInfer's math.cuh) ----
+__device__ __forceinline__ float ptx_exp2(float x) {
+    float y;
+    asm volatile("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
+    return y;
+}
+__device__ __forceinline__ float ptx_log2(float x) {
+    float y;
+    asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
+    return y;
+}
+__device__ __forceinline__ float ptx_rcp(float x) {
+    float y;
+    asm volatile("rcp.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
+    return y;
+}
+
+// Match FlashInfer's sentinel value (safe for ex2.approx input range)
+constexpr float NEG_INF = -5e4f;
+
 // ---- Type helpers ----
 template <bool FP8_KV>
 struct KVType {
@@ -160,7 +180,7 @@ tiled_split_kv_partial_paged(
         if (tid < HEAD_DIM)
             partial_O[split_idx * total_heads * HEAD_DIM + head_linear * HEAD_DIM + tid] = 0.0f;
         if (tid == 0)
-            partial_lse[split_idx * total_heads + head_linear] = -FLT_MAX;
+            partial_lse[split_idx * total_heads + head_linear] = NEG_INF;
         return;
     }
 
@@ -194,9 +214,9 @@ tiled_split_kv_partial_paged(
     const int sub_tid     = tid % R;
     const int d_start_qk  = sub_tid * D_PER_THREAD;
 
-    // Online softmax state
-    float rowmax = -FLT_MAX;
-    float rowsum = 0.0f;
+    // Online softmax state (match FlashInfer: m=-5e4, d=1.0)
+    float rowmax = NEG_INF;
+    float rowsum = 1.0f;
     float o_val  = 0.0f;
 
     // Tile loop
@@ -239,9 +259,9 @@ tiled_split_kv_partial_paged(
             if constexpr (R >= 8) dot += __shfl_xor_sync(0xffffffff, dot, 4);
         }
 
-        // scale already includes k_scale when FP8_KV
+        // scale is already in log2 domain: (1/sqrt(d) * k_scale) * log2(e)
         float score = dot * scale;
-        if (score_idx >= tile_len) score = -FLT_MAX;
+        if (score_idx >= tile_len) score = NEG_INF;
 
         if (sub_tid == 0 && score_idx < BLOCK_KV)
             p_smem[score_idx] = score;
@@ -258,9 +278,10 @@ tiled_split_kv_partial_paged(
 
         // ==============================================================
         // Step 4: Online softmax (thread 0, overlapped with V load)
+        //         All values in log-base-2 domain; use ptx_exp2
         // ==============================================================
         if (tid == 0) {
-            float tile_max = -FLT_MAX;
+            float tile_max = NEG_INF;
             for (int n = 0; n < tile_len; n++)
                 tile_max = fmaxf(tile_max, p_smem[n]);
 
@@ -268,7 +289,7 @@ tiled_split_kv_partial_paged(
 
             float tile_sum = 0.0f;
             for (int n = 0; n < tile_len; n++) {
-                float p = __expf(p_smem[n] - new_max);
+                float p = ptx_exp2(p_smem[n] - new_max);
                 p_smem[n] = p;
                 tile_sum += p;
             }
@@ -288,7 +309,7 @@ tiled_split_kv_partial_paged(
         {
             const float tile_new_max = p_smem[BLOCK_KV];
             const float tile_sum     = p_smem[BLOCK_KV + 1];
-            const float rescale      = __expf(rowmax - tile_new_max);
+            const float rescale      = ptx_exp2(rowmax - tile_new_max);
 
             o_val  *= rescale;
             rowsum  = rowsum * rescale + tile_sum;
@@ -309,21 +330,21 @@ tiled_split_kv_partial_paged(
     }  // end tile loop
 
     // ==============================================================
-    // Normalize, apply v_scale, and write partial results
+    // Normalize and write partial results
+    // Match FlashInfer: rcp.approx for division, base-2 LSE
+    // v_scale is NOT applied here — applied post-kernel in Python (matches FlashInfer)
     // ==============================================================
-    if (rowsum > 0.0f)
-        o_val /= rowsum;
-
-    // v_scale: dequantize V contribution (1.0 for BF16, actual scale for FP8)
-    if constexpr (FP8_KV) {
-        o_val *= v_scale;
+    {
+        float d_rcp = (rowmax != NEG_INF) ? ptx_rcp(rowsum) : 0.f;
+        o_val *= d_rcp;
     }
 
     if (tid < HEAD_DIM)
         partial_O[split_idx * total_heads * HEAD_DIM + head_linear * HEAD_DIM + tid] = o_val;
 
     if (tid == 0) {
-        float lse = (rowsum > 0.0f) ? rowmax + logf(rowsum) : -FLT_MAX;
+        // Base-2 LSE: m_log2 + log2(d), matching FlashInfer's state_t::get_lse()
+        float lse = (rowmax != NEG_INF) ? rowmax + ptx_log2(rowsum) : NEG_INF;
         partial_lse[split_idx * total_heads + head_linear] = lse;
     }
 }
@@ -346,7 +367,8 @@ __global__ void split_kv_reduce_v2(
 
     if (head_linear >= total_heads || tid >= HEAD_DIM) return;
 
-    float max_lse = -FLT_MAX;
+    // LSE values are in base-2 domain; use ptx_exp2 for merge (matches FlashInfer cascade.cuh)
+    float max_lse = NEG_INF;
     for (int s = 0; s < num_splits; s++) {
         float lse = partial_lse[s * total_heads + head_linear];
         max_lse = fmaxf(max_lse, lse);
@@ -356,12 +378,13 @@ __global__ void split_kv_reduce_v2(
     float sum_val = 0.0f;
     for (int s = 0; s < num_splits; s++) {
         float lse = partial_lse[s * total_heads + head_linear];
-        float w = (lse > -FLT_MAX + 1.0f) ? __expf(lse - max_lse) : 0.0f;
+        float w = (lse > NEG_INF + 1.0f) ? ptx_exp2(lse - max_lse) : 0.0f;
         sum_exp += w;
         sum_val += w * partial_O[s * total_heads * HEAD_DIM + head_linear * HEAD_DIM + tid];
     }
 
-    float result = (sum_exp > 0.0f) ? sum_val / sum_exp : 0.0f;
+    // Match FlashInfer: __fdividef for final normalization
+    float result = (sum_exp > 0.0f) ? __fdividef(sum_val, sum_exp) : 0.0f;
     O[head_linear * HEAD_DIM + tid] = __float2bfloat16(result);
 }
 
@@ -391,8 +414,9 @@ static void launch_decode(
     float v_scale,
     cudaStream_t stream
 ) {
-    // Absorb k_scale into softmax scale
-    float scale = (1.0f / sqrtf((float)head_dim)) * k_scale;
+    // Absorb k_scale into softmax scale, pre-multiply by log2(e)
+    // to match FlashInfer's log-base-2 domain (variants.cuh: sm_scale_log2)
+    float scale = (1.0f / sqrtf((float)head_dim)) * k_scale * 1.44269504088896340736f;
 
     // Adaptive split count
     int num_splits;

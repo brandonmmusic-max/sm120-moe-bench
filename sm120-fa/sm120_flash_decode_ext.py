@@ -245,4 +245,9 @@ def sm120_flash_decode_paged(
         v_scale,
     )
 
+    # Apply v_scale post-kernel on BF16 output (matches FlashInfer decode.py:1434-1440)
+    is_fp8 = key_cache.dtype == torch.float8_e4m3fn
+    if is_fp8 and v_scale != 1.0:
+        output.mul_(v_scale)
+
     return output
