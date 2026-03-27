@@ -11,6 +11,7 @@
  *
  * Supports: HEAD_DIM 128/256, GQA, variable seqlen, BF16 and FP8 E4M3 KV cache.
  * KV cache layout (vLLM): [num_blocks, block_size, num_kv_heads, head_dim]
+ * Supports interleaved K/V via kv_block_stride parameter.
  *
  * FP8 KV cache support:
  *   - Template parameter FP8_KV selects BF16 (2B) or FP8 E4M3 (1B) KV dtype
@@ -100,6 +101,7 @@ __device__ __forceinline__ void load_paged_tile(
     int block_size,
     int num_kv_heads,
     int max_blocks_per_seq,
+    int kv_block_stride,   // elements per block (contiguous: block_size*kv_heads*head_dim; interleaved: 2x)
     int tid,
     int num_threads
 ) {
@@ -117,7 +119,8 @@ __device__ __forceinline__ void load_paged_tile(
             const int page_idx = kv_pos / block_size;
             const int page_off = kv_pos % block_size;
             const int blk = block_table[seq_idx * max_blocks_per_seq + page_idx];
-            const int src = ((blk * block_size + page_off) * num_kv_heads + kv_head) * HEAD_DIM + d;
+            // HND layout: [num_blocks, num_kv_heads, block_size, head_dim]
+            const int src = blk * kv_block_stride + (kv_head * block_size + page_off) * HEAD_DIM + d;
             cp_async_16B(&kv_smem[kv_local * HEAD_DIM + d], &cache[src]);
         } else {
             // Zero-fill out-of-bounds positions (16 bytes regardless of dtype)
@@ -152,6 +155,7 @@ tiled_split_kv_partial_paged(
     int num_kv_heads,
     int block_size,
     int max_blocks_per_seq,
+    int kv_block_stride,  // elements per block in cache (supports interleaved K/V)
     float scale,          // = 1/sqrt(d) * k_scale when FP8_KV
     float v_scale,        // applied at output (1.0 for BF16)
     int kv_per_split
@@ -235,7 +239,7 @@ tiled_split_kv_partial_paged(
         load_paged_tile<HEAD_DIM, BLOCK_KV, FP8_KV>(
             kv_smem, key_cache, block_table, seq_idx,
             tile_start, tile_end, kv_head,
-            block_size, num_kv_heads, max_blocks_per_seq,
+            block_size, num_kv_heads, max_blocks_per_seq, kv_block_stride,
             tid, NUM_THREADS);
         cp_async_wait_all();
         __syncthreads();
@@ -273,7 +277,7 @@ tiled_split_kv_partial_paged(
         load_paged_tile<HEAD_DIM, BLOCK_KV, FP8_KV>(
             kv_smem, val_cache, block_table, seq_idx,
             tile_start, tile_end, kv_head,
-            block_size, num_kv_heads, max_blocks_per_seq,
+            block_size, num_kv_heads, max_blocks_per_seq, kv_block_stride,
             tid, NUM_THREADS);
 
         // ==============================================================
@@ -410,6 +414,7 @@ static void launch_decode(
     int block_size,
     int max_blocks_per_seq,
     int max_splits,
+    int kv_block_stride,
     float k_scale,
     float v_scale,
     cudaStream_t stream
@@ -445,7 +450,7 @@ static void launch_decode(
         kernel<<<grid1, HD, smem_bytes, stream>>>(
             Q, key_cache, val_cache, block_table, seq_lens,
             partial_O, partial_lse,
-            num_q_heads, num_kv_heads, block_size, max_blocks_per_seq,
+            num_q_heads, num_kv_heads, block_size, max_blocks_per_seq, kv_block_stride,
             scale, v_scale, kv_per_split);
 
         dim3 grid2(total_heads);
@@ -464,7 +469,7 @@ static void launch_decode(
         kernel<<<grid1, HD, smem_bytes, stream>>>(
             Q, key_cache, val_cache, block_table, seq_lens,
             partial_O, partial_lse,
-            num_q_heads, num_kv_heads, block_size, max_blocks_per_seq,
+            num_q_heads, num_kv_heads, block_size, max_blocks_per_seq, kv_block_stride,
             scale, v_scale, kv_per_split);
 
         dim3 grid2(total_heads);
@@ -496,6 +501,7 @@ extern "C" void sm120_flash_decode_paged_launch(
     int block_size,
     int max_blocks_per_seq,
     int max_splits,
+    int kv_block_stride,
     cudaStream_t stream
 ) {
     launch_decode<false>(
@@ -503,7 +509,7 @@ extern "C" void sm120_flash_decode_paged_launch(
         partial_O, partial_lse,
         batch_size, num_q_heads, num_kv_heads, head_dim,
         max_seq_len, block_size, max_blocks_per_seq, max_splits,
-        1.0f, 1.0f, stream);
+        kv_block_stride, 1.0f, 1.0f, stream);
 }
 
 // FP8 E4M3 launcher
@@ -524,6 +530,7 @@ extern "C" void sm120_flash_decode_paged_fp8_launch(
     int block_size,
     int max_blocks_per_seq,
     int max_splits,
+    int kv_block_stride,
     float k_scale,
     float v_scale,
     cudaStream_t stream
@@ -533,5 +540,5 @@ extern "C" void sm120_flash_decode_paged_fp8_launch(
         partial_O, partial_lse,
         batch_size, num_q_heads, num_kv_heads, head_dim,
         max_seq_len, block_size, max_blocks_per_seq, max_splits,
-        k_scale, v_scale, stream);
+        kv_block_stride, k_scale, v_scale, stream);
 }

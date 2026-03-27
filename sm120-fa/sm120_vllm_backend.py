@@ -17,8 +17,10 @@ from vllm.v1.attention.backends.flashinfer import (
     FlashInferImpl,
     FlashInferMetadata,
     FlashInferMetadataBuilder,
+    TRTLLMPrefill,
 )
-from vllm.v1.attention.backend import AttentionType
+from vllm.v1.attention.backend import AttentionType, AttentionCGSupport
+from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
@@ -82,8 +84,31 @@ class SM120FlashAttentionBackend(FlashInferBackend):
         return SM120FlashInferImpl
 
     @staticmethod
-    def get_builder_cls() -> type["FlashInferMetadataBuilder"]:
-        return FlashInferMetadataBuilder
+    def get_builder_cls() -> type["SM120MetadataBuilder"]:
+        return SM120MetadataBuilder
+
+
+class SM120MetadataBuilder(FlashInferMetadataBuilder):
+    """Override CUDA graph support to UNIFORM_BATCH.
+
+    The SM120 decode kernel handles any batch size (Sq=1..N),
+    so we don't need TRTLLMDecode for UNIFORM_BATCH support.
+    Stores seq_lens and block_tables on metadata for SM120 MTP verify.
+    """
+
+    @classmethod
+    def get_cudagraph_support(cls, vllm_config, kv_cache_spec) -> AttentionCGSupport:
+        return AttentionCGSupport.UNIFORM_BATCH
+
+    def build(self, common_prefix_len: int, common_attn_metadata: CommonAttentionMetadata, fast_build: bool = False) -> FlashInferMetadata:
+        metadata = super().build(common_prefix_len, common_attn_metadata, fast_build=fast_build)
+        # Store seq_lens and block_tables for SM120 MTP verify path
+        # These are needed when prefill is FIPrefill (no block_tables/seq_lens)
+        metadata._sm120_seq_lens = common_attn_metadata.seq_lens
+        metadata._sm120_block_tables = common_attn_metadata.block_table_tensor
+        metadata._sm120_query_start_loc = common_attn_metadata.query_start_loc
+        metadata._sm120_max_seq_len = common_attn_metadata.max_seq_len
+        return metadata
 
 
 class SM120FlashInferImpl(FlashInferImpl):
@@ -134,9 +159,14 @@ class SM120FlashInferImpl(FlashInferImpl):
         if not self._sm120_init_attempted:
             self._try_init_sm120(query.device)
 
-        # Dispatch decode to SM120 kernel when conditions are met:
-        # Pure decode, no cascade, has TRTLLMDecode with raw block_tables
-        can_use_sm120 = (
+        # DEBUG: log dispatch info
+        if hasattr(attn_metadata, '_debug_logged') is False or not getattr(attn_metadata, '_debug_logged', False):
+            logger.info("SM120 dispatch: num_decodes=%d, num_decode_tokens=%d, num_prefills=%d, num_prefill_tokens=%d",
+                        attn_metadata.num_decodes, attn_metadata.num_decode_tokens,
+                        attn_metadata.num_prefills, attn_metadata.num_prefill_tokens)
+
+        # Dispatch decode to SM120 kernel when conditions are met
+        can_use_sm120_decode = (
             self._sm120_decode_available
             and attn_metadata.num_prefills == 0
             and attn_metadata.num_decodes > 0
@@ -148,12 +178,14 @@ class SM120FlashInferImpl(FlashInferImpl):
             and hasattr(attn_metadata.decode, 'block_tables')
         )
 
-        if can_use_sm120:
+        if can_use_sm120_decode:
             return self._forward_sm120_decode(
                 layer, query, kv_cache, attn_metadata, output
             )
 
-        # Fall through to FlashInfer for everything else (prefill, mixed, etc.)
+        # MTP verify falls through to FlashInfer — repeat_interleave is not CUDA-graph-safe.
+        # Sprint 14 showed 68% MTP acceptance with SM120 decode + FlashInfer verify.
+        # Fall through to FlashInfer for everything else (prefill, MTP verify, mixed, etc.)
         return super().forward(
             layer, query, key, value, kv_cache, attn_metadata,
             output, output_scale, output_block_scale,
@@ -170,29 +202,143 @@ class SM120FlashInferImpl(FlashInferImpl):
         ext = _get_sm120_decode()
 
         decode_meta = attn_metadata.decode
-        num_tokens = attn_metadata.num_decode_tokens
-        key_cache, value_cache = kv_cache.unbind(0)
-
-        q = query[:num_tokens]
-
-        workspace = _get_workspace(
-            num_tokens, self.num_heads, self.head_size, query.device
-        )
+        num_decode_tokens = attn_metadata.num_decode_tokens
+        num_decodes = attn_metadata.num_decodes
+        key_cache, value_cache = kv_cache[:, 0], kv_cache[:, 1]
 
         # Get KV dequant scales from layer (default 1.0 for BF16)
         k_scale = getattr(layer, '_k_scale_float', 1.0)
         v_scale = getattr(layer, '_v_scale_float', 1.0)
 
-        # Use block_tables and seq_lens from TRTLLMDecode metadata
+        # Determine query tokens per request
+        # For MTP verify: num_decode_tokens = num_decodes * q_per_req
+        q_per_req = num_decode_tokens // num_decodes
+
+        if q_per_req == 1:
+            # Fast path: standard Sq=1 decode
+            q = query[:num_decode_tokens]
+
+            workspace = _get_workspace(
+                num_decode_tokens, self.num_heads, self.head_size, query.device
+            )
+
+            ext.sm120_flash_decode_paged(
+                query=q,
+                key_cache=key_cache,
+                value_cache=value_cache,
+                block_table=decode_meta.block_tables,
+                seq_lens=decode_meta.seq_lens,
+                output=output[:num_decode_tokens],
+                workspace=workspace,
+                max_seq_len=decode_meta.max_seq_len,
+                k_scale=k_scale,
+                v_scale=v_scale,
+            )
+        else:
+            # MTP verification: multiple query tokens per request
+            # Token layout is contiguous per request:
+            # [req0_q0, req0_q1, ..., req0_qN, req1_q0, ...]
+            # Reshape to [num_decodes, q_per_req, num_heads, head_size]
+            q_all = query[:num_decode_tokens].view(
+                num_decodes, q_per_req, self.num_heads, self.head_size
+            )
+            o_all = output[:num_decode_tokens].view(
+                num_decodes, q_per_req, self.num_heads, self.head_size
+            )
+
+            workspace = _get_workspace(
+                num_decodes, self.num_heads, self.head_size, query.device
+            )
+
+            for qi in range(q_per_req):
+                q_slice = q_all[:, qi, :, :].contiguous()  # [num_decodes, num_heads, head_size]
+                o_slice = o_all[:, qi, :, :]
+
+                # Adjust seq_lens for causal: position qi sees qi more KV entries
+                if qi == 0:
+                    adj_seq_lens = decode_meta.seq_lens
+                    adj_max_seq_len = decode_meta.max_seq_len
+                else:
+                    adj_seq_lens = decode_meta.seq_lens + qi
+                    adj_max_seq_len = decode_meta.max_seq_len + qi
+
+                ext.sm120_flash_decode_paged(
+                    query=q_slice,
+                    key_cache=key_cache,
+                    value_cache=value_cache,
+                    block_table=decode_meta.block_tables,
+                    seq_lens=adj_seq_lens,
+                    output=o_slice,
+                    workspace=workspace,
+                    max_seq_len=adj_max_seq_len,
+                    k_scale=k_scale,
+                    v_scale=v_scale,
+                )
+
+        return output
+
+    def _forward_sm120_mtp_verify(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: FlashInferMetadata,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        """Handle MTP verification through SM120 decode kernel.
+
+        MTP verify is classified as prefill (num_prefills>0, small token count).
+        We call the decode kernel once per query token to match draft numerics.
+
+        CUDA graph safe: no .item() calls, fixed loop count, tensor-only ops.
+        """
+        ext = _get_sm120_decode()
+        num_tokens = attn_metadata.num_prefill_tokens
+        num_prefills = attn_metadata.num_prefills
+        key_cache, value_cache = kv_cache[:, 0], kv_cache[:, 1]
+
+        k_scale = getattr(layer, '_k_scale_float', 1.0)
+        v_scale = getattr(layer, '_v_scale_float', 1.0)
+
+        # Use stored metadata from SM120MetadataBuilder.build()
+        # seq_lens: [num_reqs], block_tables: [num_reqs, max_blocks]
+        # query_start_loc: [num_reqs + 1] cumulative query token offsets
+        seq_lens_kv = attn_metadata._sm120_seq_lens  # [num_reqs]
+        block_tables = attn_metadata._sm120_block_tables  # [num_reqs, max_blocks]
+        query_start_loc = attn_metadata._sm120_query_start_loc  # [num_reqs + 1]
+        max_seq_len = attn_metadata._sm120_max_seq_len
+
+        # For MTP verify: num_prefills requests, each with some query tokens.
+        # Token layout: [req0_q0, req0_q1, ..., req0_qN, req1_q0, ...]
+        # We process ALL tokens as individual Sq=1 decode calls.
+        # Each token at position i within its request sees seq_lens_kv + i KV entries.
+
+        # Expand block_tables: [num_prefills, max_blocks] -> [num_tokens, max_blocks]
+        q_lens = query_start_loc[1:] - query_start_loc[:-1]  # [num_reqs]
+        bt_expanded = block_tables.repeat_interleave(q_lens, dim=0)
+
+        # Build per-token seq_lens with causal offset
+        global_idx = torch.arange(num_tokens, dtype=seq_lens_kv.dtype, device=seq_lens_kv.device)
+        req_starts = query_start_loc[:-1].repeat_interleave(q_lens)
+        offsets = global_idx - req_starts
+
+        sl_expanded = seq_lens_kv.repeat_interleave(q_lens) + offsets
+
+        max_sl = max_seq_len + num_tokens
+
+        workspace = _get_workspace(
+            num_tokens, self.num_heads, self.head_size, query.device
+        )
+
         ext.sm120_flash_decode_paged(
-            query=q,
+            query=query[:num_tokens],
             key_cache=key_cache,
             value_cache=value_cache,
-            block_table=decode_meta.block_tables,
-            seq_lens=decode_meta.seq_lens,
+            block_table=bt_expanded,
+            seq_lens=sl_expanded,
             output=output[:num_tokens],
             workspace=workspace,
-            max_seq_len=decode_meta.max_seq_len,
+            max_seq_len=max_sl,
             k_scale=k_scale,
             v_scale=v_scale,
         )

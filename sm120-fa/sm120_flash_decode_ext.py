@@ -45,6 +45,7 @@ extern "C" void sm120_flash_decode_paged_launch(
     int block_size,
     int max_blocks_per_seq,
     int max_splits,
+    int kv_block_stride,
     cudaStream_t stream
 );
 
@@ -66,6 +67,7 @@ extern "C" void sm120_flash_decode_paged_fp8_launch(
     int block_size,
     int max_blocks_per_seq,
     int max_splits,
+    int kv_block_stride,
     float k_scale,
     float v_scale,
     cudaStream_t stream
@@ -73,7 +75,7 @@ extern "C" void sm120_flash_decode_paged_fp8_launch(
 
 std::vector<torch::Tensor> sm120_flash_decode(
     torch::Tensor query,           // [batch, num_q_heads, head_dim] bf16
-    torch::Tensor key_cache,       // [num_blocks, block_size, num_kv_heads, head_dim] bf16 or fp8
+    torch::Tensor key_cache,       // [num_blocks, block_size, num_kv_heads, head_dim] bf16 or fp8 (may be non-contiguous view)
     torch::Tensor value_cache,     // [num_blocks, block_size, num_kv_heads, head_dim] bf16 or fp8
     torch::Tensor block_table,     // [num_seqs, max_blocks_per_seq] int32
     torch::Tensor seq_lens,        // [num_seqs] int32
@@ -87,10 +89,15 @@ std::vector<torch::Tensor> sm120_flash_decode(
     int batch_size = query.size(0);
     int num_q_heads = query.size(1);
     int head_dim = query.size(2);
-    int num_kv_heads = key_cache.size(2);
+    // Logical shape: [num_blocks, block_size, num_kv_heads, head_dim]
+    // Physical layout may be HND (strides permuted) — kernel handles via kv_block_stride
     int block_size = key_cache.size(1);
+    int num_kv_heads = key_cache.size(2);
     int max_blocks_per_seq = block_table.size(1);
     int max_splits = partial_O.size(0);
+
+    // Use stride(0) for block stride — supports both contiguous and interleaved K/V views
+    int kv_block_stride = (int)key_cache.stride(0);
 
     auto stream = c10::cuda::getCurrentCUDAStream().stream();
 
@@ -114,6 +121,7 @@ std::vector<torch::Tensor> sm120_flash_decode(
             block_size,
             max_blocks_per_seq,
             max_splits,
+            kv_block_stride,
             (float)k_scale,
             (float)v_scale,
             stream
@@ -136,6 +144,7 @@ std::vector<torch::Tensor> sm120_flash_decode(
             block_size,
             max_blocks_per_seq,
             max_splits,
+            kv_block_stride,
             stream
         );
     }
@@ -233,8 +242,8 @@ def sm120_flash_decode_paged(
 
     mod.sm120_flash_decode(
         query.contiguous(),
-        key_cache.contiguous(),
-        value_cache.contiguous(),
+        key_cache,  # non-contiguous OK: kernel uses stride(0) for block access
+        value_cache,
         block_table.contiguous(),
         seq_lens.contiguous(),
         output,
