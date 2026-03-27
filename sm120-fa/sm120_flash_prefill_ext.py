@@ -98,7 +98,7 @@ def gather_paged_kv(
 
     Handles FP8→BF16 dequant via k_scale/v_scale.
     """
-    is_fp8 = key_cache.dtype == torch.float8_e4m3fn
+    is_fp8 = key_cache.dtype in (torch.float8_e4m3fn, torch.uint8)
 
     if hnd_layout:
         # HND: [num_blocks, num_kv_heads, block_size, head_dim]
@@ -135,6 +135,10 @@ def gather_paged_kv(
 
     # Dequant FP8 → BF16
     if is_fp8:
+        # View-cast uint8 → float8_e4m3fn if needed (bit-identical)
+        if k_contig.dtype == torch.uint8:
+            k_contig = k_contig.view(torch.float8_e4m3fn)
+            v_contig = v_contig.view(torch.float8_e4m3fn)
         k_contig = k_contig.to(torch.bfloat16) * k_scale
         v_contig = v_contig.to(torch.bfloat16) * v_scale
     else:

@@ -106,6 +106,14 @@ class SM120FlashAttentionBackend(FlashInferBackend):
     def get_builder_cls() -> type["SM120MetadataBuilder"]:
         return SM120MetadataBuilder
 
+    @classmethod
+    def get_required_kv_cache_layout(cls) -> str:
+        # Force HND layout: CUDA kernel assumes HND for K/V address computation.
+        # NHD is the default on SM120 but our kernel's address formula is:
+        #   blk * stride + (kv_head * block_size + token) * head_dim  (HND)
+        # HND stride_order permutes logical (N,2,BS,Hkv,HD) to physical (N,2,Hkv,BS,HD).
+        return "HND"
+
 
 class SM120MetadataBuilder(FlashInferMetadataBuilder):
     """Override CUDA graph support to UNIFORM_SINGLE_TOKEN_DECODE.
@@ -201,9 +209,11 @@ class SM120FlashInferImpl(FlashInferImpl):
         if (self._sm120_decode_available
                 and sm120_eligible
                 and attn_metadata.num_prefills == 0
-                and attn_metadata.num_decodes > 0
-                and attn_metadata.decode is not None
-                and hasattr(attn_metadata.decode, 'block_tables')):
+                and attn_metadata.num_decodes > 0):
+            if not hasattr(self, '_logged_decode'):
+                self._logged_decode = True
+                logger.info("SM120 dispatch → decode (num_decodes=%d, tokens=%d)",
+                            attn_metadata.num_decodes, attn_metadata.num_decode_tokens)
             return self._forward_sm120_decode(
                 layer, query, kv_cache, attn_metadata, output
             )
@@ -227,16 +237,35 @@ class SM120FlashInferImpl(FlashInferImpl):
         )
 
         if is_true_prefill:
+            if not hasattr(self, '_logged_prefill'):
+                self._logged_prefill = True
+                logger.info("SM120 dispatch → prefill (num_prefills=%d, tokens=%d)",
+                            attn_metadata.num_prefills, attn_metadata.num_prefill_tokens)
             return self._forward_sm120_prefill(
                 layer, query, kv_cache, attn_metadata, output
             )
 
         if is_mtp_verify:
+            if not hasattr(self, '_logged_mtp'):
+                self._logged_mtp = True
+                logger.info("SM120 dispatch → MTP verify (num_prefills=%d, tokens=%d)",
+                            attn_metadata.num_prefills, attn_metadata.num_prefill_tokens)
             return self._forward_sm120_mtp_verify(
                 layer, query, kv_cache, attn_metadata, output
             )
 
         # Fallback to FlashInfer (should rarely happen)
+        if not hasattr(self, '_logged_fallback'):
+            self._logged_fallback = True
+            logger.warning(
+                "SM120 fallback to FlashInfer: eligible=%s, num_prefills=%d, "
+                "num_decodes=%d, num_prefill_tokens=%d, decode=%s, "
+                "has_block_tables=%s",
+                sm120_eligible, attn_metadata.num_prefills,
+                attn_metadata.num_decodes, attn_metadata.num_prefill_tokens,
+                attn_metadata.decode is not None,
+                hasattr(attn_metadata, '_sm120_block_tables'),
+            )
         return super().forward(
             layer, query, key, value, kv_cache, attn_metadata,
             output, output_scale, output_block_scale,
@@ -256,10 +285,14 @@ class SM120FlashInferImpl(FlashInferImpl):
     ) -> torch.Tensor:
         ext = _get_sm120_decode()
 
-        decode_meta = attn_metadata.decode
         num_decode_tokens = attn_metadata.num_decode_tokens
         num_decodes = attn_metadata.num_decodes
         key_cache, value_cache = kv_cache[:, 0], kv_cache[:, 1]
+
+        # Use our stored metadata (always available via SM120MetadataBuilder)
+        block_tables = attn_metadata._sm120_block_tables
+        seq_lens = attn_metadata._sm120_seq_lens
+        max_seq_len = attn_metadata._sm120_max_seq_len
 
         # Debug: log shapes/strides on first call
         if not hasattr(self, '_sm120_debug_logged'):
@@ -270,7 +303,7 @@ class SM120FlashInferImpl(FlashInferImpl):
                 "block_tables.shape=%s seq_lens=%s num_decode_tokens=%d",
                 kv_cache.shape, kv_cache.stride(),
                 key_cache.shape, key_cache.stride(), key_cache.dtype,
-                decode_meta.block_tables.shape, decode_meta.seq_lens[:min(4, num_decodes)],
+                block_tables.shape, seq_lens[:min(4, num_decodes)],
                 num_decode_tokens,
             )
 
@@ -293,14 +326,25 @@ class SM120FlashInferImpl(FlashInferImpl):
                 query=q,
                 key_cache=key_cache,
                 value_cache=value_cache,
-                block_table=decode_meta.block_tables,
-                seq_lens=decode_meta.seq_lens,
+                block_table=block_tables,
+                seq_lens=seq_lens,
                 output=output[:num_decode_tokens],
                 workspace=workspace,
-                max_seq_len=decode_meta.max_seq_len,
+                max_seq_len=max_seq_len,
                 k_scale=k_scale,
                 v_scale=v_scale,
             )
+
+            # DEBUG: check for kernel completion / CUDA errors
+            if not hasattr(self, '_decode_sync_logged'):
+                self._decode_sync_logged = True
+                torch.cuda.synchronize()
+                out_slice = output[:num_decode_tokens]
+                has_nan = torch.isnan(out_slice).any().item()
+                has_inf = torch.isinf(out_slice).any().item()
+                logger.info("SM120 decode kernel completed: has_nan=%s, has_inf=%s, out_norm=%.4f",
+                            has_nan, has_inf, out_slice.float().norm().item())
+
         else:
             # MTP verification: multiple query tokens per request
             q_all = query[:num_decode_tokens].view(
@@ -319,17 +363,17 @@ class SM120FlashInferImpl(FlashInferImpl):
                 o_slice = o_all[:, qi, :, :]
 
                 if qi == 0:
-                    adj_seq_lens = decode_meta.seq_lens
-                    adj_max_seq_len = decode_meta.max_seq_len
+                    adj_seq_lens = seq_lens
+                    adj_max_seq_len = max_seq_len
                 else:
-                    adj_seq_lens = decode_meta.seq_lens + qi
-                    adj_max_seq_len = decode_meta.max_seq_len + qi
+                    adj_seq_lens = seq_lens + qi
+                    adj_max_seq_len = max_seq_len + qi
 
                 ext.sm120_flash_decode_paged(
                     query=q_slice,
                     key_cache=key_cache,
                     value_cache=value_cache,
-                    block_table=decode_meta.block_tables,
+                    block_table=block_tables,
                     seq_lens=adj_seq_lens,
                     output=o_slice,
                     workspace=workspace,
@@ -367,13 +411,14 @@ class SM120FlashInferImpl(FlashInferImpl):
         block_tables = attn_metadata._sm120_block_tables         # [num_reqs, max_blocks]
 
         key_cache, value_cache = kv_cache[:, 0], kv_cache[:, 1]
-        # HND layout: [num_blocks, num_kv_heads, block_size, head_dim]
-        block_size = key_cache.shape[2]
+        # vLLM logical shape after [:, 0]: [num_blocks, block_size, num_kv_heads, head_dim]
+        # (NHD logical order — get_kv_cache_shape returns (N, 2, BS, Hkv, HD))
+        block_size = key_cache.shape[1]
 
         k_scale = getattr(layer, '_k_scale_float', 1.0)
         v_scale = getattr(layer, '_v_scale_float', 1.0)
 
-        is_fp8 = key_cache.dtype == torch.float8_e4m3fn
+        is_fp8 = key_cache.dtype in (torch.float8_e4m3fn, torch.uint8)
 
         # Log on first prefill call
         if not hasattr(self, '_sm120_prefill_logged'):
@@ -406,6 +451,7 @@ class SM120FlashInferImpl(FlashInferImpl):
             bt = block_tables[req_idx]
 
             # Gather paged KV → contiguous BF16
+            # key_cache logical shape: [num_blocks, block_size, num_kv_heads, head_dim] (NHD)
             k_contig, v_contig = prefill_ext.gather_paged_kv(
                 key_cache=key_cache,
                 value_cache=value_cache,
@@ -413,7 +459,7 @@ class SM120FlashInferImpl(FlashInferImpl):
                 seq_len=kv_seq_len,
                 k_scale=k_scale,
                 v_scale=v_scale,
-                hnd_layout=True,
+                hnd_layout=False,
             )
             # k_contig, v_contig: [num_kv_heads, kv_seq_len, head_dim] bf16
 
