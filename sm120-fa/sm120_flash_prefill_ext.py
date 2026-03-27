@@ -5,6 +5,9 @@ JIT-compiles the CUDA kernel and provides a Python interface.
 Input layout: Q[batch*Hq, Sq, HD], K[batch*Hkv, Skv, HD], V[batch*Hkv, Skv, HD]
 Output: O[batch*Hq, Sq, HD]
 
+Supports HD=128 and HD=256 (templated in CUDA).
+Also provides gather_paged_kv() for paged→contiguous KV conversion with FP8 dequant.
+
 NOTE: No -use_fast_math (per memory: causes MTP acceptance regression)
 """
 
@@ -80,6 +83,67 @@ def _get_module():
     return _module
 
 
+def gather_paged_kv(
+    key_cache: torch.Tensor,     # [num_blocks, num_kv_heads, block_size, head_dim] (HND) or [num_blocks, block_size, num_kv_heads, head_dim] (NHD)
+    value_cache: torch.Tensor,   # same layout as key_cache
+    block_table: torch.Tensor,   # [max_blocks_per_seq] int32 — single request
+    seq_len: int,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+    hnd_layout: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Gather paged KV cache into contiguous BF16 tensors for one request.
+
+    Returns: (K_contig, V_contig) each [num_kv_heads, seq_len, head_dim] bf16
+
+    Handles FP8→BF16 dequant via k_scale/v_scale.
+    """
+    is_fp8 = key_cache.dtype == torch.float8_e4m3fn
+
+    if hnd_layout:
+        # HND: [num_blocks, num_kv_heads, block_size, head_dim]
+        num_kv_heads = key_cache.shape[1]
+        block_size = key_cache.shape[2]
+        head_dim = key_cache.shape[3]
+    else:
+        # NHD: [num_blocks, block_size, num_kv_heads, head_dim]
+        block_size = key_cache.shape[1]
+        num_kv_heads = key_cache.shape[2]
+        head_dim = key_cache.shape[3]
+
+    num_blocks_needed = (seq_len + block_size - 1) // block_size
+    block_indices = block_table[:num_blocks_needed].long()
+
+    if hnd_layout:
+        # Gather: [num_blocks_needed, num_kv_heads, block_size, head_dim]
+        k_gathered = key_cache[block_indices]
+        v_gathered = value_cache[block_indices]
+
+        # Reshape to [num_kv_heads, num_blocks_needed * block_size, head_dim]
+        k_contig = k_gathered.permute(1, 0, 2, 3).reshape(num_kv_heads, -1, head_dim)
+        v_contig = v_gathered.permute(1, 0, 2, 3).reshape(num_kv_heads, -1, head_dim)
+    else:
+        # NHD layout
+        k_gathered = key_cache[block_indices]
+        v_gathered = value_cache[block_indices]
+        k_contig = k_gathered.permute(2, 0, 1, 3).reshape(num_kv_heads, -1, head_dim)
+        v_contig = v_gathered.permute(2, 0, 1, 3).reshape(num_kv_heads, -1, head_dim)
+
+    # Trim to actual seq_len
+    k_contig = k_contig[:, :seq_len, :].contiguous()
+    v_contig = v_contig[:, :seq_len, :].contiguous()
+
+    # Dequant FP8 → BF16
+    if is_fp8:
+        k_contig = k_contig.to(torch.bfloat16) * k_scale
+        v_contig = v_contig.to(torch.bfloat16) * v_scale
+    else:
+        k_contig = k_contig.to(torch.bfloat16)
+        v_contig = v_contig.to(torch.bfloat16)
+
+    return k_contig, v_contig
+
+
 def sm120_flash_prefill_forward(
     query: torch.Tensor,    # [batch*Hq, Sq, HD] bf16
     key: torch.Tensor,      # [batch*Hkv, Skv, HD] bf16
@@ -97,6 +161,8 @@ def sm120_flash_prefill_forward(
 
     Q layout: [batch*Hq, Sq, HD], K/V layout: [batch*Hkv, Skv, HD]
     Output: [batch*Hq, Sq, HD]
+
+    Supports HD=128 and HD=256.
     """
     mod = _get_module()
 

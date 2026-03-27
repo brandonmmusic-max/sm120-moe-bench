@@ -1,13 +1,17 @@
 """
-SM120 Flash Decode Backend for vLLM.
+SM120 Flash Attention Backend for vLLM.
 
-Subclasses FlashInferBackend to intercept decode-only batches (max_query_len=1)
-and dispatch to the SM120-native split-KV decode kernel. Prefill and mixed batches
-fall through to FlashInfer (which handles FP8 KV natively on SM120).
+Subclasses FlashInferBackend to intercept:
+  - Decode (Sq=1): SM120 split-KV decode kernel
+  - Prefill (Sq>8): SM120 MMA prefill kernel (gather paged KV → contiguous)
+  - MTP verify (Sq<=8): SM120 decode kernel with per-token causal offsets
+
+Zero FlashInfer in the attention forward path.
 
 Supports both BF16 and FP8 E4M3 KV cache dtypes.
-
 Registered as FLASH_ATTN in the backend registry to override the default.
+
+NOTE: No -use_fast_math (per memory: causes MTP acceptance regression)
 """
 
 import torch
@@ -25,8 +29,9 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
-# Lazy import of our kernel
+# Lazy import of our kernels
 _sm120_decode_module = None
+_sm120_prefill_module = None
 _workspace = None
 
 
@@ -42,6 +47,20 @@ def _get_sm120_decode():
         _sm120_decode_module = mod
         logger.info("SM120 Flash Decode kernel loaded successfully")
     return _sm120_decode_module
+
+
+def _get_sm120_prefill():
+    """Lazy-load the SM120 flash prefill kernel."""
+    global _sm120_prefill_module
+    if _sm120_prefill_module is None:
+        import importlib.util, os
+        ext_path = os.path.join(os.path.dirname(__file__), "sm120_flash_prefill_ext.py")
+        spec = importlib.util.spec_from_file_location("sm120_flash_prefill_ext", ext_path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _sm120_prefill_module = mod
+        logger.info("SM120 Flash Prefill kernel loaded successfully")
+    return _sm120_prefill_module
 
 
 def _get_workspace(batch_size, num_q_heads, head_dim, device):
@@ -71,8 +90,8 @@ def _get_workspace(batch_size, num_q_heads, head_dim, device):
 class SM120FlashAttentionBackend(FlashInferBackend):
     """SM120-optimized attention backend.
 
-    Extends FlashInfer to intercept pure-decode batches and use SM120 kernel.
-    Everything else (prefill, mixed, cascade) falls through to FlashInfer.
+    Intercepts decode AND prefill to use SM120 kernels.
+    Zero FlashInfer in the forward path.
     """
 
     @staticmethod
@@ -89,23 +108,19 @@ class SM120FlashAttentionBackend(FlashInferBackend):
 
 
 class SM120MetadataBuilder(FlashInferMetadataBuilder):
-    """Override CUDA graph support to UNIFORM_BATCH.
+    """Override CUDA graph support to UNIFORM_SINGLE_TOKEN_DECODE.
 
-    The SM120 decode kernel handles any batch size (Sq=1..N),
-    so we don't need TRTLLMDecode for UNIFORM_BATCH support.
-    Stores seq_lens and block_tables on metadata for SM120 MTP verify.
+    The SM120 decode kernel handles any batch size (Sq=1..N).
+    Stores seq_lens, block_tables, query_start_loc on metadata for SM120 paths.
     """
 
     @classmethod
     def get_cudagraph_support(cls, vllm_config, kv_cache_spec) -> AttentionCGSupport:
-        # UNIFORM_BATCH enables FULL+PIECEWISE but hangs on verdict-sprint11
-        # Use UNIFORM_SINGLE_TOKEN_DECODE (PIECEWISE only) for now
         return AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
 
     def build(self, common_prefix_len: int, common_attn_metadata: CommonAttentionMetadata, fast_build: bool = False) -> FlashInferMetadata:
         metadata = super().build(common_prefix_len, common_attn_metadata, fast_build=fast_build)
-        # Store seq_lens and block_tables for SM120 MTP verify path
-        # These are needed when prefill is FIPrefill (no block_tables/seq_lens)
+        # Store metadata for SM120 decode/prefill/MTP paths
         metadata._sm120_seq_lens = common_attn_metadata.seq_lens
         metadata._sm120_block_tables = common_attn_metadata.block_table_tensor
         metadata._sm120_query_start_loc = common_attn_metadata.query_start_loc
@@ -114,7 +129,7 @@ class SM120MetadataBuilder(FlashInferMetadataBuilder):
 
 
 class SM120FlashInferImpl(FlashInferImpl):
-    """FlashInfer impl that dispatches decode to SM120 kernel."""
+    """FlashInfer impl that dispatches decode AND prefill to SM120 kernels."""
 
     def __init__(self, *args, **kwargs):
         # Capture attn_type before super().__init__ which doesn't store it
@@ -124,13 +139,16 @@ class SM120FlashInferImpl(FlashInferImpl):
         super().__init__(*args, **kwargs)
         self.attn_type = attn_type
         self._sm120_decode_available = False
+        self._sm120_prefill_available = False
         self._sm120_init_attempted = False
 
     def _try_init_sm120(self, device):
-        """Attempt to initialize SM120 decode kernel (once)."""
+        """Attempt to initialize SM120 kernels (once)."""
         if self._sm120_init_attempted:
             return
         self._sm120_init_attempted = True
+
+        # Init decode kernel
         try:
             _get_sm120_decode()
             self._sm120_decode_available = True
@@ -138,7 +156,15 @@ class SM120FlashInferImpl(FlashInferImpl):
             logger.info("SM120 decode kernel: enabled (head_dim=%d, GQA=%d:%d, kv_dtype=%s)",
                         self.head_size, self.num_heads, self.num_kv_heads, kv_dtype_str)
         except Exception as e:
-            logger.warning("SM120 decode kernel: disabled (%s), falling back to FlashInfer", e)
+            logger.warning("SM120 decode kernel: disabled (%s)", e)
+
+        # Init prefill kernel
+        try:
+            _get_sm120_prefill()
+            self._sm120_prefill_available = True
+            logger.info("SM120 prefill kernel: enabled (head_dim=%d)", self.head_size)
+        except Exception as e:
+            logger.warning("SM120 prefill kernel: disabled (%s), falling back to FlashInfer", e)
 
     def forward(
         self,
@@ -161,32 +187,9 @@ class SM120FlashInferImpl(FlashInferImpl):
         if not self._sm120_init_attempted:
             self._try_init_sm120(query.device)
 
-        # Dispatch decode to SM120 kernel when conditions are met
-        can_use_sm120_decode = (
-            self._sm120_decode_available
-            and attn_metadata.num_prefills == 0
-            and attn_metadata.num_decodes > 0
-            and self.attn_type == AttentionType.DECODER
-            and not attn_metadata.use_cascade
-            and self.alibi_slopes is None
-            and self.sliding_window == (-1, -1)
-            and attn_metadata.decode is not None
-            and hasattr(attn_metadata.decode, 'block_tables')
-        )
-
-        if can_use_sm120_decode:
-            return self._forward_sm120_decode(
-                layer, query, kv_cache, attn_metadata, output
-            )
-
-        # MTP verification: classified as "prefill" with small token count
-        # Route through SM120 decode kernel for identical numerics with draft path
-        can_use_sm120_mtp_verify = (
-            self._sm120_decode_available
-            and attn_metadata.num_prefills > 0
-            and attn_metadata.num_prefill_tokens <= attn_metadata.num_prefills * 8  # MTP verify: ≤8 tokens per req
-            and attn_metadata.num_decodes == 0
-            and self.attn_type == AttentionType.DECODER
+        # Common guards for SM120 dispatch
+        sm120_eligible = (
+            self.attn_type == AttentionType.DECODER
             and not attn_metadata.use_cascade
             and self.alibi_slopes is None
             and self.sliding_window == (-1, -1)
@@ -194,17 +197,54 @@ class SM120FlashInferImpl(FlashInferImpl):
             and attn_metadata._sm120_block_tables is not None
         )
 
-        # MTP verify path disabled — hangs on verdict-sprint11
-        # if can_use_sm120_mtp_verify:
-        #     return self._forward_sm120_mtp_verify(
-        #         layer, query, kv_cache, attn_metadata, output
-        #     )
+        # ---- Pure decode (Sq=1 per request) ----
+        if (self._sm120_decode_available
+                and sm120_eligible
+                and attn_metadata.num_prefills == 0
+                and attn_metadata.num_decodes > 0
+                and attn_metadata.decode is not None
+                and hasattr(attn_metadata.decode, 'block_tables')):
+            return self._forward_sm120_decode(
+                layer, query, kv_cache, attn_metadata, output
+            )
 
-        # Absolute fallback — should never hit this for decoder attention
+        # ---- MTP verify (classified as prefill, ≤8 tokens per req) ----
+        is_mtp_verify = (
+            self._sm120_decode_available
+            and sm120_eligible
+            and attn_metadata.num_prefills > 0
+            and attn_metadata.num_prefill_tokens <= attn_metadata.num_prefills * 8
+            and attn_metadata.num_decodes == 0
+        )
+
+        # ---- True prefill (Sq > 8 per request on average) ----
+        is_true_prefill = (
+            self._sm120_prefill_available
+            and sm120_eligible
+            and attn_metadata.num_prefills > 0
+            and attn_metadata.num_decodes == 0
+            and not is_mtp_verify
+        )
+
+        if is_true_prefill:
+            return self._forward_sm120_prefill(
+                layer, query, kv_cache, attn_metadata, output
+            )
+
+        if is_mtp_verify:
+            return self._forward_sm120_mtp_verify(
+                layer, query, kv_cache, attn_metadata, output
+            )
+
+        # Fallback to FlashInfer (should rarely happen)
         return super().forward(
             layer, query, key, value, kv_cache, attn_metadata,
             output, output_scale, output_block_scale,
         )
+
+    # ================================================================
+    # Decode path (Sq=1)
+    # ================================================================
 
     def _forward_sm120_decode(
         self,
@@ -239,7 +279,6 @@ class SM120FlashInferImpl(FlashInferImpl):
         v_scale = getattr(layer, '_v_scale_float', 1.0)
 
         # Determine query tokens per request
-        # For MTP verify: num_decode_tokens = num_decodes * q_per_req
         q_per_req = num_decode_tokens // num_decodes
 
         if q_per_req == 1:
@@ -264,9 +303,6 @@ class SM120FlashInferImpl(FlashInferImpl):
             )
         else:
             # MTP verification: multiple query tokens per request
-            # Token layout is contiguous per request:
-            # [req0_q0, req0_q1, ..., req0_qN, req1_q0, ...]
-            # Reshape to [num_decodes, q_per_req, num_heads, head_size]
             q_all = query[:num_decode_tokens].view(
                 num_decodes, q_per_req, self.num_heads, self.head_size
             )
@@ -279,10 +315,9 @@ class SM120FlashInferImpl(FlashInferImpl):
             )
 
             for qi in range(q_per_req):
-                q_slice = q_all[:, qi, :, :].contiguous()  # [num_decodes, num_heads, head_size]
+                q_slice = q_all[:, qi, :, :].contiguous()
                 o_slice = o_all[:, qi, :, :]
 
-                # Adjust seq_lens for causal: position qi sees qi more KV entries
                 if qi == 0:
                     adj_seq_lens = decode_meta.seq_lens
                     adj_max_seq_len = decode_meta.max_seq_len
@@ -304,6 +339,118 @@ class SM120FlashInferImpl(FlashInferImpl):
                 )
 
         return output
+
+    # ================================================================
+    # Prefill path (Sq > 8) — gather paged KV → contiguous → MMA kernel
+    # ================================================================
+
+    def _forward_sm120_prefill(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: FlashInferMetadata,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        """Dispatch prefill through SM120 MMA prefill kernel.
+
+        For each prefill request:
+        1. Gather paged KV → contiguous BF16 [num_kv_heads, seq_len, HD]
+        2. Reshape Q → [num_q_heads, query_len, HD]
+        3. Call contiguous prefill kernel
+        """
+        prefill_ext = _get_sm120_prefill()
+
+        num_prefills = attn_metadata.num_prefills
+        query_start_loc = attn_metadata._sm120_query_start_loc  # [num_reqs + 1]
+        seq_lens = attn_metadata._sm120_seq_lens                # [num_reqs]
+        block_tables = attn_metadata._sm120_block_tables         # [num_reqs, max_blocks]
+
+        key_cache, value_cache = kv_cache[:, 0], kv_cache[:, 1]
+        # HND layout: [num_blocks, num_kv_heads, block_size, head_dim]
+        block_size = key_cache.shape[2]
+
+        k_scale = getattr(layer, '_k_scale_float', 1.0)
+        v_scale = getattr(layer, '_v_scale_float', 1.0)
+
+        is_fp8 = key_cache.dtype == torch.float8_e4m3fn
+
+        # Log on first prefill call
+        if not hasattr(self, '_sm120_prefill_logged'):
+            self._sm120_prefill_logged = True
+            logger.info(
+                "SM120 prefill dispatch: num_prefills=%d, kv_cache.shape=%s, "
+                "key_cache.dtype=%s, block_size=%d, head_dim=%d, GQA=%d:%d, "
+                "k_scale=%.4f, v_scale=%.4f",
+                num_prefills, kv_cache.shape, key_cache.dtype, block_size,
+                self.head_size, self.num_heads, self.num_kv_heads,
+                k_scale, v_scale,
+            )
+
+        # For pure prefill batches (num_decodes==0), all requests are prefill.
+        # query_start_loc covers all requests.
+        num_decodes = attn_metadata.num_decodes  # should be 0 for this path
+
+        for i in range(num_prefills):
+            req_idx = num_decodes + i  # global request index
+
+            # Query token range
+            q_start = int(query_start_loc[req_idx].item())
+            q_end = int(query_start_loc[req_idx + 1].item())
+            query_len = q_end - q_start
+
+            # KV sequence length (includes current prefill tokens already in cache)
+            kv_seq_len = int(seq_lens[req_idx].item())
+
+            # Block table for this request
+            bt = block_tables[req_idx]
+
+            # Gather paged KV → contiguous BF16
+            k_contig, v_contig = prefill_ext.gather_paged_kv(
+                key_cache=key_cache,
+                value_cache=value_cache,
+                block_table=bt,
+                seq_len=kv_seq_len,
+                k_scale=k_scale,
+                v_scale=v_scale,
+                hnd_layout=True,
+            )
+            # k_contig, v_contig: [num_kv_heads, kv_seq_len, head_dim] bf16
+
+            # Q slice: [query_len, num_heads, head_dim] → [num_heads, query_len, head_dim]
+            q_req = query[q_start:q_end].permute(1, 0, 2).contiguous()
+            # q_req: [num_heads, query_len, head_dim]
+
+            # Output slice
+            o_req = torch.empty(
+                self.num_heads, query_len, self.head_size,
+                dtype=torch.bfloat16, device=query.device,
+            )
+
+            # Call prefill kernel
+            # Layout: Q[batch*Hq, Sq, HD], K[batch*Hkv, Skv, HD], V[batch*Hkv, Skv, HD]
+            # batch=1 for per-request dispatch
+            prefill_ext.sm120_flash_prefill_forward(
+                query=q_req,
+                key=k_contig,
+                value=v_contig,
+                output=o_req,
+                batch=1,
+                Hq=self.num_heads,
+                Hkv=self.num_kv_heads,
+                Sq=query_len,
+                Skv=kv_seq_len,
+                causal=True,
+            )
+
+            # Write back: [num_heads, query_len, head_dim] → [query_len, num_heads, head_dim]
+            output[q_start:q_end] = o_req.permute(1, 0, 2)
+
+        return output
+
+    # ================================================================
+    # MTP verify path (Sq <= 8, use decode kernel with causal offsets)
+    # ================================================================
 
     def _forward_sm120_mtp_verify(
         self,
@@ -333,23 +480,13 @@ class SM120FlashInferImpl(FlashInferImpl):
         block_tables = attn_metadata._sm120_block_tables   # [num_reqs, max_blocks]
         max_seq_len = attn_metadata._sm120_max_seq_len
 
-        # For MTP verify: expand block_table to num_tokens rows
-        # Single request: block_tables[0:1] → expand to [num_tokens, max_blocks]
-        # Multi request: repeat each request's row by its query count
-        # expand() is a view (no copy, CUDA-graph-safe)
-        # Build per-token block_tables and seq_lens for all requests
-        # Works for 1 or N concurrent users. All tensor ops, CUDA-graph-safe.
         query_start_loc = attn_metadata._sm120_query_start_loc  # [num_reqs + 1]
         q_lens = query_start_loc[1:] - query_start_loc[:-1]    # [num_reqs]
 
         # Expand block_tables: repeat each request's row by its query token count
-        # For 1 user with 4 tokens: [1, max_blocks] → [4, max_blocks]
-        # For 2 users with 4 tokens each: [2, max_blocks] → [8, max_blocks]
         bt_expanded = block_tables.repeat_interleave(q_lens, dim=0)  # [num_tokens, max_blocks]
 
         # Build per-token seq_lens with causal offset
-        # Token i within request r sees seq_lens_kv[r] + offset_within_request
-        # Ensure offset buffer exists and is large enough
         if not hasattr(self, '_mtp_offsets') or self._mtp_offsets.size(0) < num_tokens:
             self._mtp_offsets = torch.arange(
                 max(num_tokens, 16), dtype=seq_lens_kv.dtype, device=seq_lens_kv.device
