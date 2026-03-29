@@ -180,8 +180,9 @@ class VerdictMoEExperts(mk.FusedMoEExpertsModular):
         moe_parallel_config: FusedMoEParallelConfig,
     ) -> bool:
         return not (
-            moe_parallel_config.use_fi_all2allv_kernels
-            or moe_parallel_config.use_deepep_ht_kernels
+            getattr(moe_parallel_config, 'use_all2all_kernels', False)
+            or getattr(moe_parallel_config, 'use_fi_all2allv_kernels', False)
+            or getattr(moe_parallel_config, 'use_deepep_ht_kernels', False)
         )
 
     @staticmethod
