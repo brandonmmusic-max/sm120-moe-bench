@@ -100,13 +100,15 @@ def extract_hidden_states(args):
 
     # Load with 8-bit quantization so the full model fits on GPUs
     # BF16 = ~794GB (doesn't fit 4x144GB), INT8 = ~397GB (fits across 4 GPUs)
+    from transformers import BitsAndBytesConfig
     use_vllm = False
     t0 = time.time()
     num_gpus = torch.cuda.device_count()
-    print(f"Loading target model {args.target_model} with load_in_8bit on {num_gpus} GPUs...")
+    print(f"Loading target model {args.target_model} with INT8 on {num_gpus} GPUs...")
+    quantization_config = BitsAndBytesConfig(load_in_8bit=True)
     model = AutoModelForCausalLM.from_pretrained(
         args.target_model,
-        load_in_8bit=True,
+        quantization_config=quantization_config,
         device_map="auto",
         trust_remote_code=True,
     )
