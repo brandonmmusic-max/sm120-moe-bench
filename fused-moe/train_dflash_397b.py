@@ -224,7 +224,7 @@ def extract_hidden_states(args):
     # Process in mini-batches for better GPU utilization
     # With device_map=auto, layers are pipeline-sharded across GPUs.
     # Larger batches keep all GPUs busy processing different layers concurrently.
-    extract_batch_size = 32
+    extract_batch_size = 256  # Large batch keeps pipeline parallel GPUs saturated
     print(f"  Extraction batch size: {extract_batch_size}")
 
     for i in range(0, len(all_token_ids), extract_batch_size):
