@@ -104,36 +104,33 @@ def extract_hidden_states(args):
     use_vllm = False
     t0 = time.time()
     num_gpus = torch.cuda.device_count()
-    # 4-bit NF4: ~199GB quantized, fits in 4×144GB (576GB)
-    # Monkey-patch BNB 4-bit validator — it incorrectly rejects CPU dispatch
-    # for small FP32 modules (embeddings, layernorms) even when model fits on GPU.
-    # The validation is not functional, just a guard — quantization works fine without it.
+    # Try quanto (HF-native quantization, no bitsandbytes dependency issues)
+    # Falls back to BF16 if quanto unavailable
+    loaded = False
     try:
-        from transformers.quantizers.quantizer_bnb_4bit import Bnb4BitHfQuantizer
-        _orig_validate = Bnb4BitHfQuantizer.validate_environment
-        def _patched_validate(self, *args, **kwargs):
-            try:
-                return _orig_validate(self, *args, **kwargs)
-            except ValueError:
-                pass
-        Bnb4BitHfQuantizer.validate_environment = _patched_validate
-        print("  Patched BNB 4-bit validator (allow CPU offload for FP32 modules)")
-    except Exception:
-        pass
+        from transformers import QuantoConfig
+        quanto_config = QuantoConfig(weights="int4")
+        print(f"Loading target model {args.target_model} quanto-int4 on {num_gpus} GPUs...")
+        model = AutoModelForCausalLM.from_pretrained(
+            args.target_model,
+            quantization_config=quanto_config,
+            device_map="auto",
+            trust_remote_code=True,
+        )
+        loaded = True
+        print(f"  Loaded with quanto int4")
+    except Exception as e:
+        print(f"  quanto failed: {e}")
 
-    bnb_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_compute_dtype=torch.bfloat16,
-        bnb_4bit_quant_type="nf4",
-        llm_int8_enable_fp32_cpu_offload=True,
-    )
-    print(f"Loading target model {args.target_model} NF4 on {num_gpus} GPUs...")
-    model = AutoModelForCausalLM.from_pretrained(
-        args.target_model,
-        quantization_config=bnb_config,
-        device_map="auto",
-        trust_remote_code=True,
-    )
+    if not loaded:
+        print(f"  Falling back to BF16 device_map=auto...")
+        model = AutoModelForCausalLM.from_pretrained(
+            args.target_model,
+            torch_dtype=torch.bfloat16,
+            device_map="auto",
+            trust_remote_code=True,
+        )
+        print(f"  Loaded BF16 (pipeline parallel)")
     model.eval()
     print(f"  Model loaded in {time.time()-t0:.0f}s (INT8, {num_gpus} GPUs)")
 
