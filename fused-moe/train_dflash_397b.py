@@ -520,9 +520,11 @@ def train_dflash(args):
                     noise_emb,
                 )
 
-                # Position IDs
+                # Position IDs — need 2*S because DFlash attention concatenates
+                # target_hidden + hidden_states for K/V, doubling sequence length.
+                # Rotary embeddings must cover the full K/V length.
                 B, S = tokens.shape
-                pos_ids = torch.arange(S, device=device).unsqueeze(0).expand(B, -1)
+                pos_ids = torch.arange(2 * S, device=device).unsqueeze(0).expand(B, -1)
 
                 # Forward through draft model
                 output = draft(
