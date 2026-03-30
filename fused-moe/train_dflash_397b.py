@@ -104,7 +104,10 @@ def extract_hidden_states(args):
     use_vllm = False
     t0 = time.time()
     num_gpus = torch.cuda.device_count()
-    bnb_config = BitsAndBytesConfig(load_in_8bit=True)
+    bnb_config = BitsAndBytesConfig(
+        load_in_8bit=True,
+        llm_int8_enable_fp32_cpu_offload=True,
+    )
     print(f"Loading target model {args.target_model} INT8 on {num_gpus} GPUs...")
     model = AutoModelForCausalLM.from_pretrained(
         args.target_model,
