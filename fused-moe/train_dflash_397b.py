@@ -406,9 +406,10 @@ def train_dflash(args):
     device = torch.device("cuda:0")
     cache_dir = Path(args.hidden_states_dir)
 
-    # Load tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(args.draft_model, trust_remote_code=True)
+    # Load tokenizer from TARGET model (draft model may not have a proper tokenizer)
+    tokenizer = AutoTokenizer.from_pretrained(args.target_model, trust_remote_code=True)
     vocab_size = len(tokenizer)
+    print(f"  Tokenizer vocab_size: {vocab_size}")
 
     # Load draft model
     print("Loading base DFlash model...")
