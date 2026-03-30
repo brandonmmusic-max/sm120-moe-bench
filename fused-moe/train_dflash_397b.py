@@ -73,14 +73,12 @@ def extract_hidden_states(args):
     from transformers import AutoModelForCausalLM, AutoTokenizer
     from datasets import load_dataset
 
-    print(f"
-{'='*60}")
+    print("\n" + "="*60)
     print(f"Phase 1: Extracting hidden states from {args.target_model}")
     print(f"  Layers: {args.target_layer_ids}")
     print(f"  Samples: {args.num_samples}")
     print(f"  Max seq len: {args.max_seq_len}")
-    print(f"{'='*60}
-")
+    print('='*60)
 
     cache_dir = Path(args.hidden_states_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -153,12 +151,9 @@ def extract_hidden_states(args):
     print("Loading training datasets...")
     texts = []
     datasets_to_load = [
-        ("openai/gsm8k", "main", "train", lambda x: x["question"] + "
-" + x["answer"], 50000),
-        ("tatsu-lab/alpaca", None, "train", lambda x: x.get("instruction","") + "
-" + x.get("output",""), 80000),
-        ("TIGER-Lab/MMLU-Pro", None, "test", lambda x: x.get("question","") + "
-" + str(x.get("answer","")), 20000),
+        ("openai/gsm8k", "main", "train", lambda x: x["question"] + "\n" + x["answer"], 50000),
+        ("tatsu-lab/alpaca", None, "train", lambda x: x.get("instruction", "") + "\n" + x.get("output", ""), 80000),
+        ("TIGER-Lab/MMLU-Pro", None, "test", lambda x: x.get("question", "") + "\n" + str(x.get("answer", "")), 20000),
     ]
     for ds_name, ds_config, ds_split, text_fn, max_n in datasets_to_load:
         try:
@@ -179,8 +174,7 @@ def extract_hidden_states(args):
             orca = []
             for i, item in enumerate(ds):
                 if i >= remaining: break
-                orca.append(item.get("question", "") + "
-" + item.get("response", ""))
+                orca.append(item.get("question", "") + "\n" + item.get("response", ""))
             texts.extend(orca)
             print(f"  OpenOrca: {len(orca)} samples")
         except Exception as e:
@@ -408,13 +402,13 @@ def collate_fn(batch):
 def train_dflash(args):
     from transformers import AutoTokenizer, AutoModel
 
-    print(f"\n{'='*60}")
+    print("\n" + "="*60)
     print(f"Phase 2: Training DFlash draft model")
     print(f"  Base: {args.draft_model}")
     print(f"  Block size: {args.block_size}, γ={args.gamma}")
     print(f"  LR: {args.lr}, Epochs: {args.epochs}")
     print(f"  Anchor masking: {args.num_anchors} anchors/seq")
-    print(f"{'='*60}\n")
+    print("=" * 60)
 
     device = torch.device("cuda:0")
     cache_dir = Path(args.hidden_states_dir)
