@@ -187,7 +187,7 @@ def extract_hidden_states(args):
     # Process in mini-batches for better GPU utilization
     # With device_map=auto, layers are pipeline-sharded across GPUs.
     # Larger batches keep all GPUs busy processing different layers concurrently.
-    extract_batch_size = 256  # GPTQ-Int4 ~228GB on 576GB = 348GB free for activations
+    extract_batch_size = 4  # BF16 model uses ~99% VRAM, minimal room for activations
     print(f"  Extraction batch size: {extract_batch_size}")
 
     for i in range(0, len(all_token_ids), extract_batch_size):
