@@ -100,17 +100,33 @@ def extract_hidden_states(args):
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # Load model with tensor parallel via accelerate
-    print(f"Loading target model {args.target_model} with device_map=auto...")
-    t0 = time.time()
-    model = AutoModelForCausalLM.from_pretrained(
-        args.target_model,
-        torch_dtype=torch.bfloat16,
-        device_map="auto",
-        trust_remote_code=True,
-    )
-    model.eval()
-    print(f"  Model loaded in {time.time()-t0:.0f}s")
+    # Try vLLM first (TP=4 with NVLink = fast), fallback to transformers
+    use_vllm = True
+    try:
+        from vllm import LLM, SamplingParams
+        print(f"Loading target model {args.target_model} with vLLM TP=4...")
+        t0 = time.time()
+        model = LLM(
+            model=args.target_model,
+            tensor_parallel_size=4,
+            dtype="bfloat16",
+            trust_remote_code=True,
+            max_model_len=args.max_seq_len,
+            gpu_memory_utilization=0.90,
+        )
+        print(f"  vLLM model loaded in {time.time()-t0:.0f}s (TP=4, NVLink)")
+    except Exception as e:
+        print(f"  vLLM failed ({e}), falling back to transformers...")
+        use_vllm = False
+        t0 = time.time()
+        model = AutoModelForCausalLM.from_pretrained(
+            args.target_model,
+            torch_dtype=torch.bfloat16,
+            device_map="auto",
+            trust_remote_code=True,
+        )
+        model.eval()
+        print(f"  Model loaded in {time.time()-t0:.0f}s")
 
     # Extract embeddings
     embed_weights = None
@@ -199,12 +215,34 @@ def extract_hidden_states(args):
         print(f"  Resuming from batch {batch_num} ({samples_done} samples already extracted)")
         all_token_ids = all_token_ids[samples_done:]
 
+    if use_vllm:
+        # vLLM path: use model.generate with prompt_token_ids to get hidden states
+        # vLLM doesn't directly expose hidden states, so we use the internal model
+        print("  Using vLLM internal model for hidden state extraction...")
+        # Access the internal model runner
+        try:
+            internal_model = model.llm_engine.model_executor.driver_worker.model_runner.model
+        except:
+            try:
+                internal_model = model.llm_engine.model_executor.model
+            except:
+                print("  Could not access vLLM internal model, falling back to transformers")
+                use_vllm = False
+
+    if not use_vllm:
+        internal_model = model
+    
     for i, ids in enumerate(all_token_ids):
         try:
-            input_ids = torch.tensor([ids], device=model.device if hasattr(model, 'device') else 'cuda')
+            input_ids = torch.tensor([ids], device='cuda:0')
             
-            with torch.no_grad():
-                outputs = model(input_ids=input_ids, output_hidden_states=True, return_dict=True)
+            if use_vllm:
+                # For vLLM internal model, need to handle differently
+                with torch.no_grad():
+                    outputs = internal_model(input_ids=input_ids, output_hidden_states=True, return_dict=True)
+            else:
+                with torch.no_grad():
+                    outputs = model(input_ids=input_ids, output_hidden_states=True, return_dict=True)
 
             layer_h = []
             for lid in target_layers:
@@ -216,7 +254,6 @@ def extract_hidden_states(args):
                 batch_hidden.append(concat_h)
                 batch_ids.append(input_ids.cpu())
                 
-            # Free memory
             del outputs
         except Exception as e:
             if i < 5:
