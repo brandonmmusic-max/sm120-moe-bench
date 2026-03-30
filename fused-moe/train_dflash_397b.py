@@ -165,7 +165,7 @@ def extract_hidden_states(args):
     print(f"  Total: {len(texts)} training samples")
 
     # Extract hidden states with BATCHED inference for speed
-    EXTRACT_BATCH_SIZE = 8  # Process 8 samples per forward pass
+    EXTRACT_BATCH_SIZE = 32  # Process 32 samples per forward pass (4x H200 has plenty of memory)
     print(f"Extracting hidden states (batch_size={EXTRACT_BATCH_SIZE})...")
     batch_num = 0
     batch_hidden = []
