@@ -115,24 +115,11 @@ def extract_hidden_states(args):
     print(f"  Model loaded in {time.time()-t0:.0f}s (INT8, {num_gpus} GPUs)")
 
     # Extract embeddings
-    # Extract embeddings directly (don't iterate all 397B params)
+    # Skip embedding extraction from target — we'll use the draft model's embeddings
+    # (GPTQ quantized tensors deadlock on .cpu().clone())
     embed_weights = None
     lm_head_weights = None
-    try:
-        embed_mod = model.model.embed_tokens if hasattr(model, 'model') else model.transformer.wte
-        embed_weights = embed_mod.weight.data.cpu().clone()
-        print(f"  Extracted embedding weights: {embed_weights.shape}")
-    except Exception as e:
-        print(f"  WARNING: Could not extract embed_tokens: {e}")
-
-    try:
-        lm_head_weights = model.lm_head.weight.data.cpu().clone()
-        print(f"  Extracted LM head weights: {lm_head_weights.shape}")
-    except Exception as e:
-        print(f"  WARNING: lm_head failed ({e}), using tied weights")
-        if embed_weights is not None:
-            lm_head_weights = embed_weights.clone()
-            print(f"  Using embed_tokens as lm_head (tied): {lm_head_weights.shape}")
+    print("  Skipping target embedding extraction (will use draft model embeddings in Phase 2)")
 
     # Load training data
     print("Loading training datasets...")
