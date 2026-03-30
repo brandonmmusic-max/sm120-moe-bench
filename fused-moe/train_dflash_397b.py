@@ -104,22 +104,17 @@ def extract_hidden_states(args):
     use_vllm = False
     t0 = time.time()
     num_gpus = torch.cuda.device_count()
+    # 4-bit: 397B × 0.5 bytes = ~199GB, fits easily in 4×144GB (576GB) with no CPU offload
     bnb_config = BitsAndBytesConfig(
-        load_in_8bit=True,
-        llm_int8_enable_fp32_cpu_offload=True,
+        load_in_4bit=True,
+        bnb_4bit_compute_dtype=torch.bfloat16,
+        bnb_4bit_quant_type="nf4",
     )
-    # Tell accelerate to actually use the GPU memory (default is too conservative)
-    max_memory = {i: f"{int(torch.cuda.get_device_properties(i).total_mem * 0.9 / 1e9)}GiB"
-                  for i in range(num_gpus)}
-    max_memory["cpu"] = "64GiB"  # Fallback, shouldn't be needed
-    print(f"Loading target model {args.target_model} INT8 on {num_gpus} GPUs...")
-    print(f"  max_memory: {max_memory}")
+    print(f"Loading target model {args.target_model} NF4 on {num_gpus} GPUs...")
     model = AutoModelForCausalLM.from_pretrained(
         args.target_model,
         quantization_config=bnb_config,
-        torch_dtype=torch.bfloat16,
         device_map="auto",
-        max_memory=max_memory,
         trust_remote_code=True,
     )
     model.eval()
