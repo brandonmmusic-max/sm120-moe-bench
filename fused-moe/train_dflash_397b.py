@@ -501,6 +501,10 @@ def train_dflash(args):
 
             optimizer.zero_grad()
 
+            if batch_idx == 0 and epoch == 0:
+                print(f"  DEBUG: tokens shape={tokens.shape}, hidden shape={hidden.shape}")
+                print(f"  DEBUG: mask sum={mask.sum().item()}/{mask.numel()}, block_pos max={block_pos.max().item()}")
+
             with autocast(dtype=torch.bfloat16):
                 # Embed tokens (frozen embeddings)
                 with torch.no_grad():
@@ -519,11 +523,8 @@ def train_dflash(args):
                     noise_emb,
                 )
 
-                # Position IDs — need 2*S because DFlash attention concatenates
-                # target_hidden + hidden_states for K/V, doubling sequence length.
-                # Rotary embeddings must cover the full K/V length.
                 B, S = tokens.shape
-                pos_ids = torch.arange(2 * S, device=device).unsqueeze(0).expand(B, -1)
+                pos_ids = torch.arange(S, device=device).unsqueeze(0).expand(B, -1)
 
                 # Forward through draft model
                 output = draft(
@@ -564,6 +565,9 @@ def train_dflash(args):
                     loss = (per_token_loss * weights).sum() / weights.sum().clamp(min=1e-8)
                 else:
                     loss = torch.tensor(0.0, device=device)
+
+            if batch_idx < 3 and epoch == 0:
+                print(f"  DEBUG step {batch_idx}: loss={loss.item():.6f}, mask_any={mask.any().item()}, output shape={output.shape if hasattr(output, 'shape') else 'N/A'}")
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
