@@ -104,7 +104,10 @@ def extract_hidden_states(args):
     use_vllm = False
     t0 = time.time()
     num_gpus = torch.cuda.device_count()
-    bnb_config = BitsAndBytesConfig(load_in_8bit=True)
+    bnb_config = BitsAndBytesConfig(
+        load_in_8bit=True,
+        llm_int8_enable_fp32_cpu_offload=True,
+    )
     # Tell accelerate to actually use the GPU memory (default is too conservative)
     max_memory = {i: f"{int(torch.cuda.get_device_properties(i).total_mem * 0.9 / 1e9)}GiB"
                   for i in range(num_gpus)}
