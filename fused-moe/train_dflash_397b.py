@@ -106,11 +106,23 @@ def extract_hidden_states(args):
     lm_head_weights = None
     for name, param in model.named_parameters():
         if "embed_tokens" in name and embed_weights is None:
-            embed_weights = param.data.cpu().clone()
-            print(f"  Extracted embedding weights: {embed_weights.shape}")
+            try:
+                embed_weights = param.data.cpu().clone()
+                print(f"  Extracted embedding weights: {embed_weights.shape}")
+            except NotImplementedError:
+                print(f"  WARNING: embed_tokens on meta device, skipping")
         if "lm_head" in name and lm_head_weights is None:
-            lm_head_weights = param.data.cpu().clone()
-            print(f"  Extracted LM head weights: {lm_head_weights.shape}")
+            try:
+                lm_head_weights = param.data.cpu().clone()
+                print(f"  Extracted LM head weights: {lm_head_weights.shape}")
+            except NotImplementedError:
+                # LM head may be offloaded to CPU/meta — try to get it from the model directly
+                print(f"  WARNING: lm_head on meta device, trying tied weights")
+    
+    # If lm_head failed, it's likely tied to embed_tokens (weight sharing)
+    if lm_head_weights is None and embed_weights is not None:
+        lm_head_weights = embed_weights.clone()
+        print(f"  Using embed_tokens as lm_head (tied weights): {lm_head_weights.shape}")
 
     # Load diverse training data
     print("Loading training datasets...")
