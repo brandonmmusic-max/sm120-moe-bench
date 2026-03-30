@@ -496,6 +496,7 @@ def train_dflash(args):
         for batch_idx, batch in enumerate(dataloader):
             hidden = batch["hidden_states"].to(device)        # [B, S, concat_H]
             tokens = batch["input_ids"].to(device)             # [B, S]
+            tokens = tokens.clamp(0, vocab_size - 1)           # Clamp to vocab bounds
             mask = batch["mask"].to(device)                    # [B, S]
             block_pos = batch["block_positions"].to(device)    # [B, S]
 
