@@ -104,42 +104,21 @@ def extract_hidden_states(args):
     use_vllm = False
     t0 = time.time()
     num_gpus = torch.cuda.device_count()
-    # 4-bit NF4: ~199GB, fits in 4×144GB (576GB)
-    # BNB rejects device_map="auto" if any module lands on CPU.
-    # Fix: compute device map as a dict, force everything to GPU.
-    from accelerate import infer_auto_device_map, init_empty_weights
-    from transformers import AutoConfig
-
+    # 4-bit NF4: ~199GB quantized, fits in 4×144GB (576GB)
+    # llm_int8_enable_fp32_cpu_offload works for BOTH 4-bit and 8-bit (legacy name)
+    # — it bypasses BNB's validation that rejects any CPU-dispatched modules
+    # — any small modules that spill to CPU stay FP32 (embeddings, layernorms)
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_compute_dtype=torch.bfloat16,
         bnb_4bit_quant_type="nf4",
+        llm_int8_enable_fp32_cpu_offload=True,
     )
-
     print(f"Loading target model {args.target_model} NF4 on {num_gpus} GPUs...")
-
-    # Step 1: Create empty model to get module structure
-    config = AutoConfig.from_pretrained(args.target_model, trust_remote_code=True)
-    with init_empty_weights():
-        empty_model = AutoModelForCausalLM.from_config(config, trust_remote_code=True)
-
-    # Step 2: Compute device map with all GPU memory available
-    max_memory = {i: f"{int(torch.cuda.get_device_properties(i).total_mem * 0.92 / 1e9)}GiB"
-                  for i in range(num_gpus)}
-    print(f"  max_memory: {max_memory}")
-    device_map = infer_auto_device_map(empty_model, max_memory=max_memory)
-
-    # Step 3: Force any CPU/disk entries back to GPU (there's plenty of room in 4-bit)
-    for key, val in list(device_map.items()):
-        if val in ("cpu", "disk"):
-            device_map[key] = 0
-    del empty_model
-
-    # Step 4: Load with custom device map dict (not "auto")
     model = AutoModelForCausalLM.from_pretrained(
         args.target_model,
         quantization_config=bnb_config,
-        device_map=device_map,
+        device_map="auto",
         trust_remote_code=True,
     )
     model.eval()
