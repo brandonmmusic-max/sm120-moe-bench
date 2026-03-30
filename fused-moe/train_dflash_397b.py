@@ -98,33 +98,19 @@ def extract_hidden_states(args):
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # Try vLLM first (TP=4 with NVLink = fast), fallback to transformers
-    use_vllm = True
-    try:
-        from vllm import LLM, SamplingParams
-        print(f"Loading target model {args.target_model} with vLLM TP=4...")
-        t0 = time.time()
-        model = LLM(
-            model=args.target_model,
-            tensor_parallel_size=4,
-            dtype="bfloat16",
-            trust_remote_code=True,
-            max_model_len=args.max_seq_len,
-            gpu_memory_utilization=0.90,
-        )
-        print(f"  vLLM model loaded in {time.time()-t0:.0f}s (TP=4, NVLink)")
-    except Exception as e:
-        print(f"  vLLM failed ({e}), falling back to transformers...")
-        use_vllm = False
-        t0 = time.time()
-        model = AutoModelForCausalLM.from_pretrained(
-            args.target_model,
-            torch_dtype=torch.bfloat16,
-            device_map="auto",
-            trust_remote_code=True,
-        )
-        model.eval()
-        print(f"  Model loaded in {time.time()-t0:.0f}s")
+    # Use transformers with device_map="auto" — shards across all GPUs via accelerate
+    use_vllm = False
+    t0 = time.time()
+    print(f"Loading target model {args.target_model} with device_map=auto...")
+    model = AutoModelForCausalLM.from_pretrained(
+        args.target_model,
+        torch_dtype=torch.bfloat16,
+        device_map="auto",
+        trust_remote_code=True,
+    )
+    model.eval()
+    num_gpus = torch.cuda.device_count()
+    print(f"  Model loaded in {time.time()-t0:.0f}s (sharded across {num_gpus} GPUs)")
 
     # Extract embeddings
     embed_weights = None
@@ -209,50 +195,72 @@ def extract_hidden_states(args):
         print(f"  Resuming from batch {batch_num} ({samples_done} samples already extracted)")
         all_token_ids = all_token_ids[samples_done:]
 
-    if use_vllm:
-        # vLLM path: use model.generate with prompt_token_ids to get hidden states
-        # vLLM doesn't directly expose hidden states, so we use the internal model
-        print("  Using vLLM internal model for hidden state extraction...")
-        # Access the internal model runner
+    # Figure out which device the first layer is on (for input placement)
+    first_device = next(model.parameters()).device
+    print(f"  First parameter device: {first_device}")
+
+    # Process in mini-batches for better GPU utilization
+    # With device_map=auto, layers are pipeline-sharded across GPUs.
+    # Larger batches keep all GPUs busy processing different layers concurrently.
+    extract_batch_size = 32
+    print(f"  Extraction batch size: {extract_batch_size}")
+
+    for i in range(0, len(all_token_ids), extract_batch_size):
+        mini_batch = all_token_ids[i:i + extract_batch_size]
         try:
-            internal_model = model.llm_engine.model_executor.driver_worker.model_runner.model
-        except:
-            try:
-                internal_model = model.llm_engine.model_executor.model
-            except:
-                print("  Could not access vLLM internal model, falling back to transformers")
-                use_vllm = False
+            # Pad mini-batch to same length
+            max_len = max(len(ids) for ids in mini_batch)
+            padded = [ids + [tokenizer.pad_token_id] * (max_len - len(ids)) for ids in mini_batch]
+            input_ids = torch.tensor(padded, device=first_device)
+            attention_mask = torch.tensor(
+                [[1] * len(ids) + [0] * (max_len - len(ids)) for ids in mini_batch],
+                device=first_device,
+            )
 
-    if not use_vllm:
-        internal_model = model
-    
-    for i, ids in enumerate(all_token_ids):
-        try:
-            input_ids = torch.tensor([ids], device='cuda:0')
-            
-            if use_vllm:
-                # For vLLM internal model, need to handle differently
-                with torch.no_grad():
-                    outputs = internal_model(input_ids=input_ids, output_hidden_states=True, return_dict=True)
-            else:
-                with torch.no_grad():
-                    outputs = model(input_ids=input_ids, output_hidden_states=True, return_dict=True)
+            with torch.no_grad():
+                outputs = model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    output_hidden_states=True,
+                    return_dict=True,
+                )
 
-            layer_h = []
-            for lid in target_layers:
-                if lid < len(outputs.hidden_states):
-                    layer_h.append(outputs.hidden_states[lid].cpu().half())
+            # Extract per-sample hidden states
+            for j, ids in enumerate(mini_batch):
+                seq_len = len(ids)
+                layer_h = []
+                for lid in target_layers:
+                    if lid < len(outputs.hidden_states):
+                        # Only take non-padded positions
+                        layer_h.append(outputs.hidden_states[lid][j, :seq_len].cpu().half())
 
-            if len(layer_h) == len(target_layers):
-                concat_h = torch.cat(layer_h, dim=-1)
-                batch_hidden.append(concat_h)
-                batch_ids.append(input_ids.cpu())
-                
+                if len(layer_h) == len(target_layers):
+                    concat_h = torch.cat(layer_h, dim=-1).unsqueeze(0)  # [1, seq, concat_H]
+                    batch_hidden.append(concat_h)
+                    batch_ids.append(torch.tensor(ids).unsqueeze(0))
+
             del outputs
+            torch.cuda.empty_cache()
         except Exception as e:
-            if i < 5:
-                print(f"    Warn: sample {i} failed: {e}")
-            continue
+            if i < 5 * extract_batch_size:
+                print(f"    Warn: batch starting at {i} failed: {e}")
+            # Fall back to one-at-a-time for this mini-batch
+            for j, ids in enumerate(mini_batch):
+                try:
+                    single_ids = torch.tensor([ids], device=first_device)
+                    with torch.no_grad():
+                        outputs = model(input_ids=single_ids, output_hidden_states=True, return_dict=True)
+                    layer_h = []
+                    for lid in target_layers:
+                        if lid < len(outputs.hidden_states):
+                            layer_h.append(outputs.hidden_states[lid].cpu().half())
+                    if len(layer_h) == len(target_layers):
+                        concat_h = torch.cat(layer_h, dim=-1)
+                        batch_hidden.append(concat_h)
+                        batch_ids.append(single_ids.cpu())
+                    del outputs
+                except Exception as e2:
+                    continue
 
         # Save periodically
         if len(batch_hidden) >= args.save_every:
