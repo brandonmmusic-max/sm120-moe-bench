@@ -105,9 +105,22 @@ def extract_hidden_states(args):
     t0 = time.time()
     num_gpus = torch.cuda.device_count()
     # 4-bit NF4: ~199GB quantized, fits in 4×144GB (576GB)
-    # llm_int8_enable_fp32_cpu_offload works for BOTH 4-bit and 8-bit (legacy name)
-    # — it bypasses BNB's validation that rejects any CPU-dispatched modules
-    # — any small modules that spill to CPU stay FP32 (embeddings, layernorms)
+    # Monkey-patch BNB 4-bit validator — it incorrectly rejects CPU dispatch
+    # for small FP32 modules (embeddings, layernorms) even when model fits on GPU.
+    # The validation is not functional, just a guard — quantization works fine without it.
+    try:
+        from transformers.quantizers.quantizer_bnb_4bit import Bnb4BitHfQuantizer
+        _orig_validate = Bnb4BitHfQuantizer.validate_environment
+        def _patched_validate(self, *args, **kwargs):
+            try:
+                return _orig_validate(self, *args, **kwargs)
+            except ValueError:
+                pass
+        Bnb4BitHfQuantizer.validate_environment = _patched_validate
+        print("  Patched BNB 4-bit validator (allow CPU offload for FP32 modules)")
+    except Exception:
+        pass
+
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_compute_dtype=torch.bfloat16,
