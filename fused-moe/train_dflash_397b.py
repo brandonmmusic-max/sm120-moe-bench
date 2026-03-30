@@ -27,7 +27,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-from torch.cuda.amp import autocast, GradScaler
+from torch.cuda.amp import autocast
 
 
 def parse_args():
@@ -478,7 +478,6 @@ def train_dflash(args):
         return 0.5 * (1 + math.cos(math.pi * progress))
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-    scaler = GradScaler()
 
     # Training loop
     print(f"\nStarting training ({args.epochs} epochs, {total_steps} steps)...")
@@ -566,11 +565,9 @@ def train_dflash(args):
                 else:
                     loss = torch.tensor(0.0, device=device)
 
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
+            loss.backward()
             torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
-            scaler.step(optimizer)
-            scaler.update()
+            optimizer.step()
             scheduler.step()
 
             epoch_loss += loss.item()
