@@ -436,12 +436,14 @@ def train_dflash(args):
                 with torch.no_grad():
                     noise_emb = embed(tokens)
 
-                # Add noise to masked positions
-                # Paper: standard block diffusion noise injection
-                noise = torch.randn_like(noise_emb) * 0.1
+                # Block diffusion noise: replace masked positions with [MASK] token embedding
+                # Standard discrete diffusion — NO Gaussian noise, just mask token substitution
+                # (Arriola et al. 2025, DFlash paper Section 3.2)
+                mask_token_id = tokenizer.eos_token_id  # Use EOS as mask token
+                mask_embedding = embed(torch.tensor([mask_token_id], device=device))  # [1, H]
                 noise_emb = torch.where(
                     mask.unsqueeze(-1).expand_as(noise_emb),
-                    noise,  # Replace masked positions with pure noise
+                    mask_embedding.expand_as(noise_emb),  # Replace with mask token embedding
                     noise_emb,
                 )
 
