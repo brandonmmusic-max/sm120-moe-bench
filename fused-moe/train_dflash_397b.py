@@ -32,7 +32,7 @@ from torch.cuda.amp import autocast, GradScaler
 
 def parse_args():
     p = argparse.ArgumentParser(description="Train DFlash drafter for Qwen3.5-397B")
-    p.add_argument("--target-model", default="Qwen/Qwen3.5-397B-A17B-GPTQ-Int4")
+    p.add_argument("--target-model", default="Qwen/Qwen3.5-397B-A17B")
     p.add_argument("--draft-model", default="z-lab/Qwen3.5-9B-DFlash")
     p.add_argument("--output-dir", default="./dflash-397b-trained")
     p.add_argument("--num-samples", type=int, default=289000)
@@ -98,21 +98,18 @@ def extract_hidden_states(args):
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # Load INT8 quantized — fits ~397GB across 4 GPUs
-    # Requires transformers >= 5.2.0 for native Qwen3.5 MoE support
-    from transformers import BitsAndBytesConfig
     use_vllm = False
     t0 = time.time()
     num_gpus = torch.cuda.device_count()
-    # GPTQ-Int4 model is pre-quantized — just load it, no on-the-fly quantization needed
-    print(f"Loading target model {args.target_model} on {num_gpus} GPUs...")
+    print(f"Loading target model {args.target_model} BF16 on {num_gpus} GPUs...")
     model = AutoModelForCausalLM.from_pretrained(
         args.target_model,
+        torch_dtype=torch.bfloat16,
         device_map="auto",
         trust_remote_code=True,
     )
     model.eval()
-    print(f"  Model loaded in {time.time()-t0:.0f}s (INT8, {num_gpus} GPUs)")
+    print(f"  Model loaded in {time.time()-t0:.0f}s (BF16, {num_gpus} GPUs)")
 
     # Extract embeddings
     # Skip embedding extraction from target — we'll use the draft model's embeddings
