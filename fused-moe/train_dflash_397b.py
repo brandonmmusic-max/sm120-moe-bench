@@ -1,35 +1,24 @@
 #!/usr/bin/env python3
 """
 DFlash Drafter Training for Qwen3.5-397B-A17B
-Reverse-engineered from z-lab/dflash model architecture + paper (arXiv:2602.06036)
+Based on arXiv:2602.06036 — Block Diffusion for Flash Speculative Decoding
 
-Run on RunPod (4x A100 80GB) or locally.
+Key training details from the paper:
+- Loss: cross-entropy with exponential decay weighting w_k = exp(-(k-1)/γ), γ=7 for B=16
+- Masking: sample 512 anchor positions per sequence, mask next block_size-1 after each
+- LR: 6e-4, cosine schedule, 0.04 warmup ratio
+- Epochs: 6
+- Embeddings: frozen, shared from target model (token embedding + LM head)
+- Hidden states: extracted from 5 uniformly-sampled target layers, projected via fc
+- Single forward pass denoising (NOT iterative diffusion)
 
 Usage:
-    # On RunPod:
-    pip install torch transformers accelerate datasets huggingface_hub bitsandbytes
-    pip install flash-attn --no-build-isolation
-    python train_dflash_397b.py --num-samples 5000 --epochs 3 --output-dir ./dflash-397b-trained
-
-    # Upload result:
-    huggingface-cli upload <your-username>/Qwen3.5-397B-DFlash ./dflash-397b-trained
-
-Architecture (from dflash.py):
-    - 5 DFlash decoder layers with cross-attention to target hidden states
-    - fc: projects concatenated hidden states from 5 target layers → hidden_size
-    - hidden_norm: RMSNorm on projected hidden states
-    - Each layer: self-attn(Q=noise, K/V=concat(target_hidden, noise)) + MLP
-    - Output: denoised hidden states → LM head for token prediction
-
-Training objective (block diffusion):
-    - Given target hidden states from layers [2,14,26,38,50] of the 397B
-    - Mask random tokens in the target sequence
-    - Train draft model to predict masked tokens from noised embeddings + hidden states
-    - This teaches the model to "denoise" multiple positions in parallel
+    python train_dflash_397b.py --target-model Qwen/Qwen3.5-397B-A17B --num-samples 289000 --epochs 6
 """
 
 import argparse
 import json
+import math
 import os
 import time
 from pathlib import Path
@@ -43,40 +32,31 @@ from torch.cuda.amp import autocast, GradScaler
 
 def parse_args():
     p = argparse.ArgumentParser(description="Train DFlash drafter for Qwen3.5-397B")
-    p.add_argument("--target-model", default="Qwen/Qwen3.5-397B-A17B",
-                    help="Target model (HF ID or local path)")
-    p.add_argument("--draft-model", default="z-lab/Qwen3.5-9B-DFlash",
-                    help="Base DFlash architecture to initialize from")
-    p.add_argument("--output-dir", default="./dflash-397b-trained",
-                    help="Output directory for trained model")
-    p.add_argument("--num-samples", type=int, default=5000,
-                    help="Number of training samples to generate")
-    p.add_argument("--max-seq-len", type=int, default=512,
-                    help="Max sequence length for training")
-    p.add_argument("--block-size", type=int, default=16,
-                    help="DFlash block size (draft tokens per round)")
-    p.add_argument("--batch-size", type=int, default=2,
-                    help="Training batch size (per GPU)")
-    p.add_argument("--epochs", type=int, default=3,
-                    help="Training epochs")
-    p.add_argument("--lr", type=float, default=1e-4,
-                    help="Learning rate")
-    p.add_argument("--target-layer-ids", default="2,14,26,38,50",
-                    help="Comma-separated target layer IDs in 397B")
-    p.add_argument("--mask-ratio", type=float, default=0.5,
-                    help="Fraction of tokens to mask during training")
-    p.add_argument("--skip-extraction", action="store_true",
-                    help="Skip hidden state extraction (use cached)")
-    p.add_argument("--hidden-states-dir", default="./hidden_states_cache",
-                    help="Directory for cached hidden states")
-    p.add_argument("--dataset", default="openai/gsm8k",
-                    help="HuggingFace dataset for training prompts")
-    p.add_argument("--wandb", action="store_true", help="Enable wandb logging")
+    p.add_argument("--target-model", default="Qwen/Qwen3.5-397B-A17B")
+    p.add_argument("--draft-model", default="z-lab/Qwen3.5-9B-DFlash")
+    p.add_argument("--output-dir", default="./dflash-397b-trained")
+    p.add_argument("--num-samples", type=int, default=289000)
+    p.add_argument("--max-seq-len", type=int, default=3072,
+                    help="Paper uses 3072 (4096 for coder)")
+    p.add_argument("--block-size", type=int, default=16)
+    p.add_argument("--batch-size", type=int, default=2)
+    p.add_argument("--epochs", type=int, default=6, help="Paper uses 6")
+    p.add_argument("--lr", type=float, default=6e-4, help="Paper uses 6e-4")
+    p.add_argument("--warmup-ratio", type=float, default=0.04)
+    p.add_argument("--gamma", type=float, default=7.0,
+                    help="Loss decay param. Paper: 7 for B=16, 5 for B=10, 4 for B=8")
+    p.add_argument("--target-layer-ids", default="2,14,26,38,50")
+    p.add_argument("--num-anchors", type=int, default=512,
+                    help="Number of anchor positions per sequence (paper: 512)")
+    p.add_argument("--skip-extraction", action="store_true")
+    p.add_argument("--hidden-states-dir", default="./hidden_states_cache")
+    p.add_argument("--save-every", type=int, default=500,
+                    help="Save checkpoint every N extraction samples")
     return p.parse_args()
 
 
 # =============================================================================
-# Phase 1: Extract hidden states from the 397B target model
+# Phase 1: Extract hidden states from the target model
 # =============================================================================
 
 def extract_hidden_states(args):
@@ -93,11 +73,12 @@ def extract_hidden_states(args):
 
     cache_dir = Path(args.hidden_states_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
-
-    # Check if already cached
     manifest = cache_dir / "manifest.json"
+
     if manifest.exists() and args.skip_extraction:
-        print("Using cached hidden states")
+        with open(manifest) as f:
+            meta = json.load(f)
+        print(f"Using cached hidden states ({meta['num_samples']} samples)")
         return
 
     target_layers = [int(x) for x in args.target_layer_ids.split(",")]
@@ -108,94 +89,135 @@ def extract_hidden_states(args):
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # Load target model with 4-bit quantization to fit in memory
+    # Load target model
     print(f"Loading target model {args.target_model}...")
-    print("  (This downloads ~234GB on first run, ~20 min on RunPod)")
     t0 = time.time()
-
     model = AutoModelForCausalLM.from_pretrained(
         args.target_model,
         torch_dtype=torch.bfloat16,
         device_map="auto",
         trust_remote_code=True,
-        attn_implementation="flash_attention_2",
     )
     model.eval()
     print(f"  Model loaded in {time.time()-t0:.0f}s")
 
-    # Load dataset
-    print(f"Loading dataset {args.dataset}...")
-    if args.dataset == "openai/gsm8k":
-        ds = load_dataset("openai/gsm8k", "main", split="train")
-        texts = [item["question"] + "\n" + item["answer"] for item in ds]
-    elif args.dataset.endswith(".jsonl"):
-        texts = []
-        with open(args.dataset) as f:
-            for line in f:
-                item = json.loads(line)
-                texts.append(item.get("prompt", "") + "\n" + item.get("completion", ""))
-    else:
-        ds = load_dataset(args.dataset, split="train")
-        texts = [item.get("text", item.get("content", str(item))) for item in ds]
+    # Also extract embeddings to freeze in draft model
+    embed_weights = None
+    lm_head_weights = None
+    for name, param in model.named_parameters():
+        if "embed_tokens" in name and embed_weights is None:
+            embed_weights = param.data.cpu().clone()
+            print(f"  Extracted embedding weights: {embed_weights.shape}")
+        if "lm_head" in name and lm_head_weights is None:
+            lm_head_weights = param.data.cpu().clone()
+            print(f"  Extracted LM head weights: {lm_head_weights.shape}")
+
+    # Load diverse training data
+    print("Loading training datasets...")
+    texts = []
+
+    datasets_to_load = [
+        ("openai/gsm8k", "main", "train", lambda x: x["question"] + "\n" + x["answer"], 50000),
+        ("tatsu-lab/alpaca", None, "train", lambda x: x.get("instruction","") + "\n" + x.get("output",""), 80000),
+        ("TIGER-Lab/MMLU-Pro", None, "test", lambda x: x.get("question","") + "\n" + str(x.get("answer","")), 20000),
+    ]
+
+    for ds_name, ds_config, ds_split, text_fn, max_n in datasets_to_load:
+        try:
+            if ds_config:
+                ds = load_dataset(ds_name, ds_config, split=ds_split)
+            else:
+                ds = load_dataset(ds_name, split=ds_split)
+            new_texts = [text_fn(item) for item in ds][:max_n]
+            texts.extend(new_texts)
+            print(f"  {ds_name}: {len(new_texts)} samples")
+        except Exception as e:
+            print(f"  {ds_name}: failed ({e})")
+
+    # Fill remaining with OpenOrca (streaming for large dataset)
+    remaining = args.num_samples - len(texts)
+    if remaining > 0:
+        try:
+            ds = load_dataset("Open-Orca/OpenOrca", split="train", streaming=True)
+            orca = []
+            for i, item in enumerate(ds):
+                if i >= remaining:
+                    break
+                orca.append(item.get("question", "") + "\n" + item.get("response", ""))
+            texts.extend(orca)
+            print(f"  OpenOrca: {len(orca)} samples")
+        except Exception as e:
+            print(f"  OpenOrca: failed ({e})")
 
     texts = texts[:args.num_samples]
-    print(f"  {len(texts)} samples loaded")
+    print(f"  Total: {len(texts)} training samples")
 
-    # Extract hidden states
+    # Extract hidden states in batches
     print("Extracting hidden states...")
-    all_hidden_states = []
-    all_input_ids = []
+    batch_num = 0
+    batch_hidden = []
+    batch_ids = []
 
     for i, text in enumerate(texts):
-        inputs = tokenizer(
-            text,
-            max_length=args.max_seq_len,
-            truncation=True,
-            return_tensors="pt",
-        ).to(model.device)
-
-        with torch.no_grad():
-            outputs = model(
-                **inputs,
-                output_hidden_states=True,
-                return_dict=True,
+        try:
+            inputs = tokenizer(
+                text, max_length=args.max_seq_len, truncation=True, return_tensors="pt"
             )
+            inputs = {k: v.to(model.device) for k, v in inputs.items()}
 
-        # Extract hidden states at target layers
-        # outputs.hidden_states is tuple of (num_layers+1) tensors
-        layer_hidden = []
-        for lid in target_layers:
-            if lid < len(outputs.hidden_states):
-                h = outputs.hidden_states[lid].cpu().to(torch.float16)
-                layer_hidden.append(h)
+            with torch.no_grad():
+                outputs = model(**inputs, output_hidden_states=True, return_dict=True)
 
-        if len(layer_hidden) == len(target_layers):
-            # Concatenate along hidden dim: [batch, seq, num_layers * hidden_size]
-            concat_hidden = torch.cat(layer_hidden, dim=-1)
-            all_hidden_states.append(concat_hidden)
-            all_input_ids.append(inputs["input_ids"].cpu())
+            layer_h = []
+            for lid in target_layers:
+                if lid < len(outputs.hidden_states):
+                    layer_h.append(outputs.hidden_states[lid].cpu().half())
 
-        if (i + 1) % 100 == 0:
-            print(f"  {i+1}/{len(texts)} samples processed")
+            if len(layer_h) == len(target_layers):
+                concat_h = torch.cat(layer_h, dim=-1)
+                batch_hidden.append(concat_h)
+                batch_ids.append(inputs["input_ids"].cpu())
+        except Exception as e:
+            if i < 5:
+                print(f"    Warn: sample {i} failed: {e}")
+            continue
 
         # Save periodically
-        if (i + 1) % 500 == 0:
+        if (i + 1) % args.save_every == 0:
             torch.save({
-                "hidden_states": all_hidden_states,
-                "input_ids": all_input_ids,
-            }, cache_dir / f"batch_{i//500}.pt")
-            print(f"  Saved batch {i//500}")
+                "hidden_states": batch_hidden,
+                "input_ids": batch_ids,
+            }, cache_dir / f"batch_{batch_num}.pt")
+            print(f"    {i+1}/{len(texts)} extracted (saved batch {batch_num}, {len(batch_hidden)} samples)")
+            batch_num += 1
+            batch_hidden = []
+            batch_ids = []
 
-    # Save final
+        if (i + 1) % 1000 == 0 and len(batch_hidden) > 0:
+            print(f"    {i+1}/{len(texts)} extracted")
+
+    # Save final batch
+    if batch_hidden:
+        torch.save({
+            "hidden_states": batch_hidden,
+            "input_ids": batch_ids,
+        }, cache_dir / f"batch_{batch_num}.pt")
+        batch_num += 1
+
+    # Save embeddings
     torch.save({
-        "hidden_states": all_hidden_states,
-        "input_ids": all_input_ids,
-        "target_layers": target_layers,
-        "model_id": args.target_model,
-    }, cache_dir / "all_hidden_states.pt")
+        "embed_weights": embed_weights,
+        "lm_head_weights": lm_head_weights,
+    }, cache_dir / "target_embeddings.pt")
 
+    # Save manifest
+    total_samples = sum(
+        len(torch.load(cache_dir / f"batch_{b}.pt")["hidden_states"])
+        for b in range(batch_num)
+    )
     meta = {
-        "num_samples": len(all_hidden_states),
+        "num_samples": total_samples,
+        "num_batches": batch_num,
         "target_layers": target_layers,
         "max_seq_len": args.max_seq_len,
         "model_id": args.target_model,
@@ -203,167 +225,197 @@ def extract_hidden_states(args):
     with open(manifest, "w") as f:
         json.dump(meta, f, indent=2)
 
-    print(f"  Extracted {len(all_hidden_states)} samples → {cache_dir}")
+    print(f"  Extracted {total_samples} samples in {batch_num} batches → {cache_dir}")
 
-    # Free target model memory
     del model
     torch.cuda.empty_cache()
 
 
 # =============================================================================
-# Phase 2: Training dataset
+# Phase 2: Training dataset with DFlash anchor-based masking
 # =============================================================================
 
-class DFlashTrainingDataset(Dataset):
-    """Dataset for DFlash training with block diffusion masking."""
+class DFlashDataset(Dataset):
+    """DFlash training dataset with anchor-based block masking.
 
-    def __init__(self, hidden_states_dir, block_size=16, mask_ratio=0.5):
-        data = torch.load(Path(hidden_states_dir) / "all_hidden_states.pt")
-        self.hidden_states = data["hidden_states"]  # list of [1, seq, concat_hidden]
-        self.input_ids = data["input_ids"]           # list of [1, seq]
+    Per the paper: randomly sample anchor positions, mask next block_size-1
+    tokens after each anchor. The anchor token is the "verified" token,
+    and the masked tokens are what the draft model learns to predict.
+    """
+
+    def __init__(self, cache_dir, block_size=16, num_anchors=512):
+        self.cache_dir = Path(cache_dir)
         self.block_size = block_size
-        self.mask_ratio = mask_ratio
+        self.num_anchors = num_anchors
+
+        with open(self.cache_dir / "manifest.json") as f:
+            meta = json.load(f)
+        self.num_batches = meta["num_batches"]
+
+        # Load all batches into memory
+        self.all_hidden = []
+        self.all_ids = []
+        for b in range(self.num_batches):
+            data = torch.load(self.cache_dir / f"batch_{b}.pt")
+            self.all_hidden.extend(data["hidden_states"])
+            self.all_ids.extend(data["input_ids"])
+
+        print(f"  Loaded {len(self.all_hidden)} samples from {self.num_batches} batches")
 
     def __len__(self):
-        return len(self.hidden_states)
+        return len(self.all_hidden)
 
     def __getitem__(self, idx):
-        hidden = self.hidden_states[idx].squeeze(0)  # [seq, concat_hidden]
-        tokens = self.input_ids[idx].squeeze(0)       # [seq]
+        hidden = self.all_hidden[idx].squeeze(0)  # [seq, concat_H]
+        tokens = self.all_ids[idx].squeeze(0)      # [seq]
         seq_len = tokens.shape[0]
 
-        # Block diffusion masking:
-        # Randomly mask `mask_ratio` fraction of positions
-        num_mask = max(1, int(seq_len * self.mask_ratio))
-        mask_positions = torch.randperm(seq_len)[:num_mask].sort().values
+        # Anchor-based masking (paper Section 3.2):
+        # Sample anchor positions, mask next block_size-1 tokens after each
+        num_possible_anchors = max(1, seq_len - self.block_size)
+        num_anchors = min(self.num_anchors, num_possible_anchors)
+        anchor_positions = torch.randperm(num_possible_anchors)[:num_anchors].sort().values
 
-        # Create masked version of tokens
-        masked_tokens = tokens.clone()
-        # Use a special noise embedding approach:
-        # Replace masked positions with random embeddings (will be learned)
+        # Create mask: True = masked (need to predict)
         mask = torch.zeros(seq_len, dtype=torch.bool)
-        mask[mask_positions] = True
+        # Create position-in-block tensor for loss weighting
+        block_positions = torch.zeros(seq_len, dtype=torch.long)
+
+        for anchor in anchor_positions:
+            for k in range(1, self.block_size):
+                pos = anchor.item() + k
+                if pos < seq_len:
+                    mask[pos] = True
+                    block_positions[pos] = k  # position within block (1-indexed)
 
         return {
-            "hidden_states": hidden.float(),     # [seq, concat_hidden]
-            "input_ids": tokens,                  # [seq]
-            "masked_ids": masked_tokens,          # [seq]
-            "mask": mask,                         # [seq]
+            "hidden_states": hidden.float(),
+            "input_ids": tokens,
+            "mask": mask,
+            "block_positions": block_positions,
         }
 
 
 def collate_fn(batch):
-    """Pad and collate training batch."""
     max_len = max(item["input_ids"].shape[0] for item in batch)
-
     hidden_dim = batch[0]["hidden_states"].shape[-1]
-    padded = {
+
+    result = {
         "hidden_states": torch.zeros(len(batch), max_len, hidden_dim),
         "input_ids": torch.zeros(len(batch), max_len, dtype=torch.long),
-        "masked_ids": torch.zeros(len(batch), max_len, dtype=torch.long),
         "mask": torch.zeros(len(batch), max_len, dtype=torch.bool),
+        "block_positions": torch.zeros(len(batch), max_len, dtype=torch.long),
         "lengths": torch.tensor([item["input_ids"].shape[0] for item in batch]),
     }
 
     for i, item in enumerate(batch):
         sl = item["input_ids"].shape[0]
-        padded["hidden_states"][i, :sl] = item["hidden_states"]
-        padded["input_ids"][i, :sl] = item["input_ids"]
-        padded["masked_ids"][i, :sl] = item["masked_ids"]
-        padded["mask"][i, :sl] = item["mask"]
+        result["hidden_states"][i, :sl] = item["hidden_states"]
+        result["input_ids"][i, :sl] = item["input_ids"]
+        result["mask"][i, :sl] = item["mask"]
+        result["block_positions"][i, :sl] = item["block_positions"]
 
-    return padded
+    return result
 
 
 # =============================================================================
-# Phase 3: Train the DFlash draft model
+# Phase 3: Train with position-weighted cross-entropy loss
 # =============================================================================
 
 def train_dflash(args):
-    """Train the DFlash draft model using block diffusion objective."""
-    from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
+    from transformers import AutoTokenizer, AutoModel
 
     print(f"\n{'='*60}")
     print(f"Phase 2: Training DFlash draft model")
     print(f"  Base: {args.draft_model}")
-    print(f"  Block size: {args.block_size}")
-    print(f"  Epochs: {args.epochs}, LR: {args.lr}")
+    print(f"  Block size: {args.block_size}, γ={args.gamma}")
+    print(f"  LR: {args.lr}, Epochs: {args.epochs}")
+    print(f"  Anchor masking: {args.num_anchors} anchors/seq")
     print(f"{'='*60}\n")
 
     device = torch.device("cuda:0")
+    cache_dir = Path(args.hidden_states_dir)
 
-    # Load tokenizer and draft model config
+    # Load tokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.draft_model, trust_remote_code=True)
-    vocab_size = tokenizer.vocab_size
+    vocab_size = len(tokenizer)
 
-    # Load the DFlash draft model (small, ~1-2B params)
+    # Load draft model
     print("Loading base DFlash model...")
-    draft_model = AutoModelForCausalLM.from_pretrained(
-        args.draft_model,
-        torch_dtype=torch.bfloat16,
-        trust_remote_code=True,
+    draft = AutoModel.from_pretrained(
+        args.draft_model, torch_dtype=torch.bfloat16, trust_remote_code=True
     ).to(device)
 
-    # Add LM head if not present (for token prediction)
-    if not hasattr(draft_model, "lm_head"):
-        config = draft_model.config
-        draft_model.lm_head = nn.Linear(
-            config.hidden_size, vocab_size, bias=False
-        ).to(device=device, dtype=torch.bfloat16)
+    # Create LM head and embedding (frozen, from target model)
+    hidden_size = draft.config.hidden_size
+    lm_head = nn.Linear(hidden_size, vocab_size, bias=False).to(device=device, dtype=torch.bfloat16)
+    embed = nn.Embedding(vocab_size, hidden_size).to(device=device, dtype=torch.bfloat16)
 
-    # Embedding layer for noise input
-    if not hasattr(draft_model, "embed_tokens"):
-        config = draft_model.config
-        draft_model.embed_tokens = nn.Embedding(
-            vocab_size, config.hidden_size
-        ).to(device=device, dtype=torch.bfloat16)
+    # Load frozen weights from target model
+    target_emb_path = cache_dir / "target_embeddings.pt"
+    if target_emb_path.exists():
+        target_emb = torch.load(target_emb_path)
+        if target_emb["embed_weights"] is not None:
+            embed.weight.data.copy_(target_emb["embed_weights"].to(torch.bfloat16))
+            embed.weight.requires_grad = False  # FREEZE per paper
+            print("  Loaded + froze target embedding weights")
+        if target_emb["lm_head_weights"] is not None:
+            lm_head.weight.data.copy_(target_emb["lm_head_weights"].to(torch.bfloat16))
+            lm_head.weight.requires_grad = False  # FREEZE per paper
+            print("  Loaded + froze target LM head weights")
+    else:
+        print("  WARNING: No target embeddings found, training from scratch")
 
-    draft_model.train()
-    num_params = sum(p.numel() for p in draft_model.parameters())
-    num_trainable = sum(p.numel() for p in draft_model.parameters() if p.requires_grad)
-    print(f"  Parameters: {num_params/1e6:.0f}M total, {num_trainable/1e6:.0f}M trainable")
+    # Only train draft model parameters (not embed/lm_head)
+    trainable_params = [p for p in draft.parameters() if p.requires_grad]
+    num_total = sum(p.numel() for p in draft.parameters()) + embed.weight.numel() + lm_head.weight.numel()
+    num_trainable = sum(p.numel() for p in trainable_params)
+    print(f"  Parameters: {num_total/1e6:.0f}M total, {num_trainable/1e6:.0f}M trainable (frozen embed+head)")
+
+    draft.train()
 
     # Dataset
     print("Loading training dataset...")
-    dataset = DFlashTrainingDataset(
+    dataset = DFlashDataset(
         args.hidden_states_dir,
         block_size=args.block_size,
-        mask_ratio=args.mask_ratio,
+        num_anchors=args.num_anchors,
     )
     dataloader = DataLoader(
-        dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        collate_fn=collate_fn,
-        num_workers=2,
-        pin_memory=True,
+        dataset, batch_size=args.batch_size, shuffle=True,
+        collate_fn=collate_fn, num_workers=4, pin_memory=True,
     )
     print(f"  {len(dataset)} samples, {len(dataloader)} batches/epoch")
 
-    # Optimizer
-    optimizer = torch.optim.AdamW(
-        draft_model.parameters(),
-        lr=args.lr,
-        weight_decay=0.01,
-        betas=(0.9, 0.95),
+    # Precompute loss weights: w_k = exp(-(k-1)/gamma) for k=1..block_size
+    gamma = args.gamma
+    loss_weights = torch.tensor(
+        [math.exp(-(k - 1) / gamma) for k in range(1, args.block_size + 1)],
+        dtype=torch.float32, device=device,
     )
+    print(f"  Loss weights (γ={gamma}): {[f'{w:.3f}' for w in loss_weights[:5].tolist()]}...")
 
-    # LR scheduler
+    # Optimizer (paper: AdamW, lr=6e-4, cosine, 0.04 warmup)
+    optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=0.01, betas=(0.9, 0.95))
+
     total_steps = len(dataloader) * args.epochs
-    warmup_steps = min(500, total_steps // 10)
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer,
-        max_lr=args.lr,
-        total_steps=total_steps,
-        pct_start=warmup_steps / total_steps,
-    )
+    warmup_steps = int(total_steps * args.warmup_ratio)
 
+    def lr_lambda(step):
+        if step < warmup_steps:
+            return step / max(warmup_steps, 1)
+        progress = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
+        return 0.5 * (1 + math.cos(math.pi * progress))
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
     scaler = GradScaler()
 
     # Training loop
     print(f"\nStarting training ({args.epochs} epochs, {total_steps} steps)...")
     global_step = 0
     best_loss = float("inf")
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     for epoch in range(args.epochs):
         epoch_loss = 0
@@ -372,107 +424,132 @@ def train_dflash(args):
         t_epoch = time.time()
 
         for batch_idx, batch in enumerate(dataloader):
-            hidden_states = batch["hidden_states"].to(device)  # [B, S, concat_H]
-            input_ids = batch["input_ids"].to(device)          # [B, S]
+            hidden = batch["hidden_states"].to(device)        # [B, S, concat_H]
+            tokens = batch["input_ids"].to(device)             # [B, S]
             mask = batch["mask"].to(device)                    # [B, S]
-            lengths = batch["lengths"]
+            block_pos = batch["block_positions"].to(device)    # [B, S]
 
             optimizer.zero_grad()
 
             with autocast(dtype=torch.bfloat16):
-                # Create noise embeddings for masked positions
-                noise_emb = draft_model.embed_tokens(input_ids)
+                # Embed tokens (frozen embeddings)
+                with torch.no_grad():
+                    noise_emb = embed(tokens)
 
-                # Add noise to masked positions (diffusion noise)
-                # Simple approach: replace masked embeddings with random noise
+                # Add noise to masked positions
+                # Paper: standard block diffusion noise injection
                 noise = torch.randn_like(noise_emb) * 0.1
                 noise_emb = torch.where(
                     mask.unsqueeze(-1).expand_as(noise_emb),
-                    noise_emb + noise,  # Add noise to masked positions
-                    noise_emb,          # Keep unmasked as-is
+                    noise,  # Replace masked positions with pure noise
+                    noise_emb,
                 )
 
                 # Position IDs
-                B, S = input_ids.shape
-                position_ids = torch.arange(S, device=device).unsqueeze(0).expand(B, -1)
+                B, S = tokens.shape
+                pos_ids = torch.arange(S, device=device).unsqueeze(0).expand(B, -1)
 
                 # Forward through draft model
-                output = draft_model(
-                    position_ids=position_ids,
+                output = draft(
+                    position_ids=pos_ids,
                     noise_embedding=noise_emb,
-                    target_hidden=hidden_states,
+                    target_hidden=hidden,
                 )
 
-                # LM head prediction
-                logits = draft_model.lm_head(output)  # [B, S, vocab]
-
-                # Loss: only on masked positions
-                loss = F.cross_entropy(
-                    logits[mask].view(-1, vocab_size),
-                    input_ids[mask].view(-1),
-                    reduction="mean",
-                )
-
-                # Accuracy on masked positions
+                # LM head (frozen)
                 with torch.no_grad():
-                    preds = logits[mask].argmax(dim=-1)
-                    correct = (preds == input_ids[mask]).sum().item()
-                    total = mask.sum().item()
+                    logits = lm_head(output.float()).to(output.dtype)
+
+                # Wait — LM head needs gradients to flow through output
+                # Actually: the output of draft model needs gradients, lm_head is linear
+                # so grad flows through even with frozen weights
+                logits = F.linear(output, lm_head.weight)  # explicit to allow grad flow
+
+                # Position-weighted cross-entropy loss on masked positions
+                if mask.any():
+                    masked_logits = logits[mask]  # [N_masked, vocab]
+                    masked_targets = tokens[mask]  # [N_masked]
+                    masked_block_pos = block_pos[mask]  # [N_masked]
+
+                    # Per-token loss
+                    per_token_loss = F.cross_entropy(
+                        masked_logits.view(-1, vocab_size),
+                        masked_targets.view(-1),
+                        reduction="none",
+                    )
+
+                    # Apply position-dependent weights: w_k = exp(-(k-1)/gamma)
+                    weights = torch.zeros_like(per_token_loss)
+                    for k in range(1, args.block_size + 1):
+                        k_mask = masked_block_pos == k
+                        if k_mask.any():
+                            weights[k_mask] = loss_weights[k - 1]
+
+                    loss = (per_token_loss * weights).sum() / weights.sum().clamp(min=1e-8)
+                else:
+                    loss = torch.tensor(0.0, device=device)
 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(draft_model.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
             scaler.step(optimizer)
             scaler.update()
             scheduler.step()
 
             epoch_loss += loss.item()
-            epoch_correct += correct
-            epoch_total += total
             global_step += 1
 
-            if (batch_idx + 1) % 50 == 0:
-                avg_loss = epoch_loss / (batch_idx + 1)
-                accuracy = epoch_correct / max(epoch_total, 1)
+            with torch.no_grad():
+                if mask.any():
+                    preds = logits[mask].argmax(-1)
+                    epoch_correct += (preds == tokens[mask]).sum().item()
+                    epoch_total += mask.sum().item()
+
+            if global_step % 200 == 0:
+                n_batches = batch_idx + 1
+                avg_loss = epoch_loss / n_batches
+                acc = epoch_correct / max(epoch_total, 1)
                 lr = scheduler.get_last_lr()[0]
-                print(f"  Epoch {epoch+1}/{args.epochs} | "
-                      f"Step {batch_idx+1}/{len(dataloader)} | "
-                      f"Loss: {avg_loss:.4f} | "
-                      f"Acc: {accuracy:.3f} | "
-                      f"LR: {lr:.2e}")
+                elapsed = time.time() - t_epoch
+                eta = elapsed / n_batches * (len(dataloader) - n_batches)
+                print(f"  E{epoch+1} Step {global_step} | "
+                      f"Loss: {avg_loss:.4f} | Acc: {acc:.3f} | "
+                      f"LR: {lr:.2e} | ETA: {eta/60:.0f}min")
 
-        avg_loss = epoch_loss / len(dataloader)
-        accuracy = epoch_correct / max(epoch_total, 1)
+        # Epoch summary
+        n_batches = len(dataloader)
+        avg_loss = epoch_loss / max(n_batches, 1)
+        acc = epoch_correct / max(epoch_total, 1)
         elapsed = time.time() - t_epoch
-        print(f"\n  Epoch {epoch+1} complete: loss={avg_loss:.4f}, "
-              f"acc={accuracy:.3f}, time={elapsed:.0f}s")
+        print(f"\n  Epoch {epoch+1}/{args.epochs}: loss={avg_loss:.4f} acc={acc:.3f} time={elapsed/60:.1f}min")
 
-        # Save best
+        # Save
         if avg_loss < best_loss:
             best_loss = avg_loss
-            save_path = Path(args.output_dir)
-            save_path.mkdir(parents=True, exist_ok=True)
-            draft_model.save_pretrained(save_path)
-            tokenizer.save_pretrained(save_path)
+            draft.save_pretrained(output_dir)
+            tokenizer.save_pretrained(output_dir)
+            # Save extra weights
+            torch.save({
+                "lm_head": lm_head.state_dict(),
+                "embed": embed.state_dict(),
+            }, output_dir / "extra_weights.pt")
 
-            # Save config with target layer info
-            config_extra = {
+            config = {
                 "dflash_config": {
                     "target_layer_ids": [int(x) for x in args.target_layer_ids.split(",")],
-                    "mask_token_id": tokenizer.convert_tokens_to_ids("<|mask|>")
-                        if "<|mask|>" in tokenizer.get_vocab()
-                        else tokenizer.eos_token_id,
+                    "mask_token_id": tokenizer.eos_token_id,
                     "block_size": args.block_size,
                 },
                 "trained_on": args.target_model,
                 "training_samples": len(dataset),
+                "epochs_completed": epoch + 1,
                 "best_loss": best_loss,
-                "best_accuracy": accuracy,
+                "accuracy": acc,
+                "gamma": args.gamma,
             }
-            with open(save_path / "training_config.json", "w") as f:
-                json.dump(config_extra, f, indent=2)
-
-            print(f"  Saved best model → {save_path}")
+            with open(output_dir / "training_config.json", "w") as f:
+                json.dump(config, f, indent=2)
+            print(f"  Saved best model → {output_dir}")
 
     print(f"\nTraining complete. Best loss: {best_loss:.4f}")
     print(f"Model saved to: {args.output_dir}")
@@ -490,21 +567,20 @@ def main():
     print(f"  Target: {args.target_model}")
     print(f"  Draft base: {args.draft_model}")
     print(f"  Samples: {args.num_samples}")
+    print(f"  Epochs: {args.epochs}, LR: {args.lr}, γ={args.gamma}")
+    print(f"  Block size: {args.block_size}, Anchors: {args.num_anchors}")
     print(f"  Output: {args.output_dir}")
     print("=" * 60)
 
-    # Phase 1: Extract hidden states
     if not args.skip_extraction:
         extract_hidden_states(args)
 
-    # Phase 2: Train
     train_dflash(args)
 
     print("\n" + "=" * 60)
     print("DONE! Next steps:")
-    print(f"  1. Upload: huggingface-cli upload <username>/Qwen3.5-397B-DFlash {args.output_dir}")
-    print(f"  2. Download to your PC")
-    print(f"  3. Launch with vLLM:")
+    print(f"  1. Download: scp -r <runpod>:{args.output_dir} ~/models/dflash-397b-trained/")
+    print(f"  2. Deploy with vLLM:")
     print(f'     --speculative-config \'{{"method":"dflash","model":"<path>","num_speculative_tokens":16}}\'')
     print("=" * 60)
 
