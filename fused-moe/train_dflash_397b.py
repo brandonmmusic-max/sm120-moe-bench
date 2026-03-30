@@ -35,12 +35,12 @@ def parse_args():
     p.add_argument("--target-model", default="Qwen/Qwen3.5-397B-A17B")
     p.add_argument("--draft-model", default="z-lab/Qwen3.5-9B-DFlash")
     p.add_argument("--output-dir", default="./dflash-397b-trained")
-    p.add_argument("--num-samples", type=int, default=289000)
+    p.add_argument("--num-samples", type=int, default=50000)
     p.add_argument("--max-seq-len", type=int, default=3072,
                     help="Paper uses 3072 (4096 for coder)")
     p.add_argument("--block-size", type=int, default=16)
     p.add_argument("--batch-size", type=int, default=2)
-    p.add_argument("--epochs", type=int, default=6, help="Paper uses 6")
+    p.add_argument("--epochs", type=int, default=2)
     p.add_argument("--lr", type=float, default=6e-4, help="Paper uses 6e-4")
     p.add_argument("--warmup-ratio", type=float, default=0.04)
     p.add_argument("--gamma", type=float, default=7.0,
