@@ -32,7 +32,7 @@ from torch.cuda.amp import autocast, GradScaler
 
 def parse_args():
     p = argparse.ArgumentParser(description="Train DFlash drafter for Qwen3.5-397B")
-    p.add_argument("--target-model", default="Qwen/Qwen3.5-397B-A17B")
+    p.add_argument("--target-model", default="Qwen/Qwen3.5-397B-A17B-GPTQ-Int4")
     p.add_argument("--draft-model", default="z-lab/Qwen3.5-9B-DFlash")
     p.add_argument("--output-dir", default="./dflash-397b-trained")
     p.add_argument("--num-samples", type=int, default=289000)
@@ -104,33 +104,13 @@ def extract_hidden_states(args):
     use_vllm = False
     t0 = time.time()
     num_gpus = torch.cuda.device_count()
-    # Try quanto (HF-native quantization, no bitsandbytes dependency issues)
-    # Falls back to BF16 if quanto unavailable
-    loaded = False
-    try:
-        from transformers import QuantoConfig
-        quanto_config = QuantoConfig(weights="int4")
-        print(f"Loading target model {args.target_model} quanto-int4 on {num_gpus} GPUs...")
-        model = AutoModelForCausalLM.from_pretrained(
-            args.target_model,
-            quantization_config=quanto_config,
-            device_map="auto",
-            trust_remote_code=True,
-        )
-        loaded = True
-        print(f"  Loaded with quanto int4")
-    except Exception as e:
-        print(f"  quanto failed: {e}")
-
-    if not loaded:
-        print(f"  Falling back to BF16 device_map=auto...")
-        model = AutoModelForCausalLM.from_pretrained(
-            args.target_model,
-            torch_dtype=torch.bfloat16,
-            device_map="auto",
-            trust_remote_code=True,
-        )
-        print(f"  Loaded BF16 (pipeline parallel)")
+    # GPTQ-Int4 model is pre-quantized — just load it, no on-the-fly quantization needed
+    print(f"Loading target model {args.target_model} on {num_gpus} GPUs...")
+    model = AutoModelForCausalLM.from_pretrained(
+        args.target_model,
+        device_map="auto",
+        trust_remote_code=True,
+    )
     model.eval()
     print(f"  Model loaded in {time.time()-t0:.0f}s (INT8, {num_gpus} GPUs)")
 
@@ -224,7 +204,7 @@ def extract_hidden_states(args):
     # Process in mini-batches for better GPU utilization
     # With device_map=auto, layers are pipeline-sharded across GPUs.
     # Larger batches keep all GPUs busy processing different layers concurrently.
-    extract_batch_size = 256  # Large batch keeps pipeline parallel GPUs saturated
+    extract_batch_size = 256  # GPTQ-Int4 ~228GB on 576GB = 348GB free for activations
     print(f"  Extraction batch size: {extract_batch_size}")
 
     for i in range(0, len(all_token_ids), extract_batch_size):
