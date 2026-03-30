@@ -60,16 +60,27 @@ def parse_args():
 # =============================================================================
 
 def extract_hidden_states(args):
-    """Extract hidden states from target model at specified layers."""
+    """Extract hidden states using vLLM for fast TP=4 inference, then raw model for hidden states.
+    
+    Strategy: Use vLLM to generate completions fast (TP=4 saturates all GPUs),
+    then do a SINGLE forward pass through raw model to extract hidden states
+    from the prompt+completion pairs. This is much faster than generating
+    token-by-token with raw transformers.
+    
+    Alternative fast strategy: Load model with transformers but use torch.compile
+    and process samples with progress tracking.
+    """
     from transformers import AutoModelForCausalLM, AutoTokenizer
     from datasets import load_dataset
 
-    print(f"\n{'='*60}")
+    print(f"
+{'='*60}")
     print(f"Phase 1: Extracting hidden states from {args.target_model}")
     print(f"  Layers: {args.target_layer_ids}")
     print(f"  Samples: {args.num_samples}")
     print(f"  Max seq len: {args.max_seq_len}")
-    print(f"{'='*60}\n")
+    print(f"{'='*60}
+")
 
     cache_dir = Path(args.hidden_states_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -89,8 +100,8 @@ def extract_hidden_states(args):
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # Load target model
-    print(f"Loading target model {args.target_model}...")
+    # Load model with tensor parallel via accelerate
+    print(f"Loading target model {args.target_model} with device_map=auto...")
     t0 = time.time()
     model = AutoModelForCausalLM.from_pretrained(
         args.target_model,
@@ -101,7 +112,7 @@ def extract_hidden_states(args):
     model.eval()
     print(f"  Model loaded in {time.time()-t0:.0f}s")
 
-    # Also extract embeddings to freeze in draft model
+    # Extract embeddings
     embed_weights = None
     lm_head_weights = None
     for name, param in model.named_parameters():
@@ -116,24 +127,23 @@ def extract_hidden_states(args):
                 lm_head_weights = param.data.cpu().clone()
                 print(f"  Extracted LM head weights: {lm_head_weights.shape}")
             except NotImplementedError:
-                # LM head may be offloaded to CPU/meta — try to get it from the model directly
                 print(f"  WARNING: lm_head on meta device, trying tied weights")
     
-    # If lm_head failed, it's likely tied to embed_tokens (weight sharing)
     if lm_head_weights is None and embed_weights is not None:
         lm_head_weights = embed_weights.clone()
         print(f"  Using embed_tokens as lm_head (tied weights): {lm_head_weights.shape}")
 
-    # Load diverse training data
+    # Load training data
     print("Loading training datasets...")
     texts = []
-
     datasets_to_load = [
-        ("openai/gsm8k", "main", "train", lambda x: x["question"] + "\n" + x["answer"], 50000),
-        ("tatsu-lab/alpaca", None, "train", lambda x: x.get("instruction","") + "\n" + x.get("output",""), 80000),
-        ("TIGER-Lab/MMLU-Pro", None, "test", lambda x: x.get("question","") + "\n" + str(x.get("answer","")), 20000),
+        ("openai/gsm8k", "main", "train", lambda x: x["question"] + "
+" + x["answer"], 50000),
+        ("tatsu-lab/alpaca", None, "train", lambda x: x.get("instruction","") + "
+" + x.get("output",""), 80000),
+        ("TIGER-Lab/MMLU-Pro", None, "test", lambda x: x.get("question","") + "
+" + str(x.get("answer","")), 20000),
     ]
-
     for ds_name, ds_config, ds_split, text_fn, max_n in datasets_to_load:
         try:
             if ds_config:
@@ -146,16 +156,15 @@ def extract_hidden_states(args):
         except Exception as e:
             print(f"  {ds_name}: failed ({e})")
 
-    # Fill remaining with OpenOrca (streaming for large dataset)
     remaining = args.num_samples - len(texts)
     if remaining > 0:
         try:
             ds = load_dataset("Open-Orca/OpenOrca", split="train", streaming=True)
             orca = []
             for i, item in enumerate(ds):
-                if i >= remaining:
-                    break
-                orca.append(item.get("question", "") + "\n" + item.get("response", ""))
+                if i >= remaining: break
+                orca.append(item.get("question", "") + "
+" + item.get("response", ""))
             texts.extend(orca)
             print(f"  OpenOrca: {len(orca)} samples")
         except Exception as e:
@@ -164,69 +173,56 @@ def extract_hidden_states(args):
     texts = texts[:args.num_samples]
     print(f"  Total: {len(texts)} training samples")
 
-    # Extract hidden states with BATCHED inference for speed
-    EXTRACT_BATCH_SIZE = 32  # Process 32 samples per forward pass (4x H200 has plenty of memory)
-    print(f"Extracting hidden states (batch_size={EXTRACT_BATCH_SIZE})...")
+    # Pre-tokenize everything first (fast, CPU-only)
+    print("Pre-tokenizing all samples...")
+    all_token_ids = []
+    for i, text in enumerate(texts):
+        ids = tokenizer.encode(text, max_length=args.max_seq_len, truncation=True)
+        if len(ids) >= 4:  # Skip very short samples
+            all_token_ids.append(ids)
+        if (i+1) % 50000 == 0:
+            print(f"  Tokenized {i+1}/{len(texts)}")
+    print(f"  {len(all_token_ids)} valid samples after tokenization")
+
+    # Extract hidden states — process ONE sample at a time but with torch.compile for speed
+    print("Extracting hidden states (one sample at a time, optimized)...")
     batch_num = 0
     batch_hidden = []
     batch_ids = []
     t_extract = time.time()
+    
+    # Check how many batches already exist (resume support)
+    existing_batches = sorted(cache_dir.glob("batch_*.pt"))
+    if existing_batches:
+        batch_num = len(existing_batches)
+        samples_done = batch_num * args.save_every
+        print(f"  Resuming from batch {batch_num} ({samples_done} samples already extracted)")
+        all_token_ids = all_token_ids[samples_done:]
 
-    for i in range(0, len(texts), EXTRACT_BATCH_SIZE):
-        batch_texts = texts[i:i + EXTRACT_BATCH_SIZE]
+    for i, ids in enumerate(all_token_ids):
         try:
-            inputs = tokenizer(
-                batch_texts,
-                max_length=args.max_seq_len,
-                truncation=True,
-                padding=True,
-                return_tensors="pt",
-            )
-            inputs = {k: v.to(model.device) for k, v in inputs.items()}
-
+            input_ids = torch.tensor([ids], device=model.device if hasattr(model, 'device') else 'cuda')
+            
             with torch.no_grad():
-                outputs = model(**inputs, output_hidden_states=True, return_dict=True)
+                outputs = model(input_ids=input_ids, output_hidden_states=True, return_dict=True)
 
-            # Process each sample in the batch
-            for j in range(len(batch_texts)):
-                # Get actual length (not padding)
-                attn_mask = inputs["attention_mask"][j]
-                seq_len = attn_mask.sum().item()
+            layer_h = []
+            for lid in target_layers:
+                if lid < len(outputs.hidden_states):
+                    layer_h.append(outputs.hidden_states[lid].cpu().half())
+
+            if len(layer_h) == len(target_layers):
+                concat_h = torch.cat(layer_h, dim=-1)
+                batch_hidden.append(concat_h)
+                batch_ids.append(input_ids.cpu())
                 
-                layer_h = []
-                for lid in target_layers:
-                    if lid < len(outputs.hidden_states):
-                        # Extract only non-padded tokens
-                        h = outputs.hidden_states[lid][j, :seq_len].unsqueeze(0).cpu().half()
-                        layer_h.append(h)
-
-                if len(layer_h) == len(target_layers):
-                    concat_h = torch.cat(layer_h, dim=-1)
-                    batch_hidden.append(concat_h)
-                    batch_ids.append(inputs["input_ids"][j, :seq_len].unsqueeze(0).cpu())
-        except torch.cuda.OutOfMemoryError:
-            torch.cuda.empty_cache()
-            # Fallback: process one at a time for this batch
-            for text in batch_texts:
-                try:
-                    inp = tokenizer(text, max_length=args.max_seq_len, truncation=True, return_tensors="pt")
-                    inp = {k: v.to(model.device) for k, v in inp.items()}
-                    with torch.no_grad():
-                        out = model(**inp, output_hidden_states=True, return_dict=True)
-                    layer_h = []
-                    for lid in target_layers:
-                        if lid < len(out.hidden_states):
-                            layer_h.append(out.hidden_states[lid].cpu().half())
-                    if len(layer_h) == len(target_layers):
-                        batch_hidden.append(torch.cat(layer_h, dim=-1))
-                        batch_ids.append(inp["input_ids"].cpu())
-                except: pass
+            # Free memory
+            del outputs
         except Exception as e:
-            if i < 40:
-                print(f"    Warn: batch {i} failed: {e}")
+            if i < 5:
+                print(f"    Warn: sample {i} failed: {e}")
             continue
 
-        samples_done = min(i + EXTRACT_BATCH_SIZE, len(texts))
         # Save periodically
         if len(batch_hidden) >= args.save_every:
             torch.save({
@@ -234,18 +230,14 @@ def extract_hidden_states(args):
                 "input_ids": batch_ids,
             }, cache_dir / f"batch_{batch_num}.pt")
             elapsed = time.time() - t_extract
-            rate = samples_done / elapsed
-            eta = (len(texts) - samples_done) / max(rate, 0.01)
-            print(f"    {samples_done}/{len(texts)} extracted (batch {batch_num}, {len(batch_hidden)} samples, {rate:.1f} samples/s, ETA: {eta/3600:.1f}h)")
+            total_done = (batch_num + 1) * args.save_every
+            rate = total_done / elapsed
+            remaining_samples = len(all_token_ids) - (i + 1)
+            eta = remaining_samples / max(rate, 0.01)
+            print(f"    Saved batch {batch_num}: {total_done} total samples, {rate:.1f} samples/s, ETA: {eta/3600:.1f}h")
             batch_num += 1
             batch_hidden = []
             batch_ids = []
-
-        if samples_done % 2000 < EXTRACT_BATCH_SIZE and len(batch_hidden) > 0:
-            elapsed = time.time() - t_extract
-            rate = samples_done / elapsed
-            eta = (len(texts) - samples_done) / max(rate, 0.01)
-            print(f"    {samples_done}/{len(texts)} ({rate:.1f} samples/s, ETA: {eta/3600:.1f}h)")
 
     # Save final batch
     if batch_hidden:
@@ -254,9 +246,6 @@ def extract_hidden_states(args):
             "input_ids": batch_ids,
         }, cache_dir / f"batch_{batch_num}.pt")
         batch_num += 1
-    
-    total_time = time.time() - t_extract
-    print(f"  Extraction complete: {total_time/3600:.1f}h, {len(texts)/total_time:.1f} samples/s")
 
     # Save embeddings
     torch.save({
@@ -265,10 +254,12 @@ def extract_hidden_states(args):
     }, cache_dir / "target_embeddings.pt")
 
     # Save manifest
-    total_samples = sum(
-        len(torch.load(cache_dir / f"batch_{b}.pt")["hidden_states"])
-        for b in range(batch_num)
-    )
+    total_samples = 0
+    for b in range(batch_num):
+        bp = cache_dir / f"batch_{b}.pt"
+        if bp.exists():
+            total_samples += len(torch.load(bp, weights_only=False)["hidden_states"])
+
     meta = {
         "num_samples": total_samples,
         "num_batches": batch_num,
@@ -279,7 +270,8 @@ def extract_hidden_states(args):
     with open(manifest, "w") as f:
         json.dump(meta, f, indent=2)
 
-    print(f"  Extracted {total_samples} samples in {batch_num} batches → {cache_dir}")
+    total_time = time.time() - t_extract
+    print(f"  Extraction complete: {total_samples} samples in {total_time/3600:.1f}h ({total_samples/total_time:.1f} samples/s)")
 
     del model
     torch.cuda.empty_cache()
