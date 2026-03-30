@@ -98,19 +98,20 @@ def extract_hidden_states(args):
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # Use transformers with device_map="auto" — shards across all GPUs via accelerate
+    # Load with 8-bit quantization so the full model fits on GPUs
+    # BF16 = ~794GB (doesn't fit 4x144GB), INT8 = ~397GB (fits across 4 GPUs)
     use_vllm = False
     t0 = time.time()
-    print(f"Loading target model {args.target_model} with device_map=auto...")
+    num_gpus = torch.cuda.device_count()
+    print(f"Loading target model {args.target_model} with load_in_8bit on {num_gpus} GPUs...")
     model = AutoModelForCausalLM.from_pretrained(
         args.target_model,
-        torch_dtype=torch.bfloat16,
+        load_in_8bit=True,
         device_map="auto",
         trust_remote_code=True,
     )
     model.eval()
-    num_gpus = torch.cuda.device_count()
-    print(f"  Model loaded in {time.time()-t0:.0f}s (sharded across {num_gpus} GPUs)")
+    print(f"  Model loaded in {time.time()-t0:.0f}s (INT8, sharded across {num_gpus} GPUs)")
 
     # Extract embeddings
     embed_weights = None
