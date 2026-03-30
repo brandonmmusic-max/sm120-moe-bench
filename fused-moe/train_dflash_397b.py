@@ -164,49 +164,88 @@ def extract_hidden_states(args):
     texts = texts[:args.num_samples]
     print(f"  Total: {len(texts)} training samples")
 
-    # Extract hidden states in batches
-    print("Extracting hidden states...")
+    # Extract hidden states with BATCHED inference for speed
+    EXTRACT_BATCH_SIZE = 8  # Process 8 samples per forward pass
+    print(f"Extracting hidden states (batch_size={EXTRACT_BATCH_SIZE})...")
     batch_num = 0
     batch_hidden = []
     batch_ids = []
+    t_extract = time.time()
 
-    for i, text in enumerate(texts):
+    for i in range(0, len(texts), EXTRACT_BATCH_SIZE):
+        batch_texts = texts[i:i + EXTRACT_BATCH_SIZE]
         try:
             inputs = tokenizer(
-                text, max_length=args.max_seq_len, truncation=True, return_tensors="pt"
+                batch_texts,
+                max_length=args.max_seq_len,
+                truncation=True,
+                padding=True,
+                return_tensors="pt",
             )
             inputs = {k: v.to(model.device) for k, v in inputs.items()}
 
             with torch.no_grad():
                 outputs = model(**inputs, output_hidden_states=True, return_dict=True)
 
-            layer_h = []
-            for lid in target_layers:
-                if lid < len(outputs.hidden_states):
-                    layer_h.append(outputs.hidden_states[lid].cpu().half())
+            # Process each sample in the batch
+            for j in range(len(batch_texts)):
+                # Get actual length (not padding)
+                attn_mask = inputs["attention_mask"][j]
+                seq_len = attn_mask.sum().item()
+                
+                layer_h = []
+                for lid in target_layers:
+                    if lid < len(outputs.hidden_states):
+                        # Extract only non-padded tokens
+                        h = outputs.hidden_states[lid][j, :seq_len].unsqueeze(0).cpu().half()
+                        layer_h.append(h)
 
-            if len(layer_h) == len(target_layers):
-                concat_h = torch.cat(layer_h, dim=-1)
-                batch_hidden.append(concat_h)
-                batch_ids.append(inputs["input_ids"].cpu())
+                if len(layer_h) == len(target_layers):
+                    concat_h = torch.cat(layer_h, dim=-1)
+                    batch_hidden.append(concat_h)
+                    batch_ids.append(inputs["input_ids"][j, :seq_len].unsqueeze(0).cpu())
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            # Fallback: process one at a time for this batch
+            for text in batch_texts:
+                try:
+                    inp = tokenizer(text, max_length=args.max_seq_len, truncation=True, return_tensors="pt")
+                    inp = {k: v.to(model.device) for k, v in inp.items()}
+                    with torch.no_grad():
+                        out = model(**inp, output_hidden_states=True, return_dict=True)
+                    layer_h = []
+                    for lid in target_layers:
+                        if lid < len(out.hidden_states):
+                            layer_h.append(out.hidden_states[lid].cpu().half())
+                    if len(layer_h) == len(target_layers):
+                        batch_hidden.append(torch.cat(layer_h, dim=-1))
+                        batch_ids.append(inp["input_ids"].cpu())
+                except: pass
         except Exception as e:
-            if i < 5:
-                print(f"    Warn: sample {i} failed: {e}")
+            if i < 40:
+                print(f"    Warn: batch {i} failed: {e}")
             continue
 
+        samples_done = min(i + EXTRACT_BATCH_SIZE, len(texts))
         # Save periodically
-        if (i + 1) % args.save_every == 0:
+        if len(batch_hidden) >= args.save_every:
             torch.save({
                 "hidden_states": batch_hidden,
                 "input_ids": batch_ids,
             }, cache_dir / f"batch_{batch_num}.pt")
-            print(f"    {i+1}/{len(texts)} extracted (saved batch {batch_num}, {len(batch_hidden)} samples)")
+            elapsed = time.time() - t_extract
+            rate = samples_done / elapsed
+            eta = (len(texts) - samples_done) / max(rate, 0.01)
+            print(f"    {samples_done}/{len(texts)} extracted (batch {batch_num}, {len(batch_hidden)} samples, {rate:.1f} samples/s, ETA: {eta/3600:.1f}h)")
             batch_num += 1
             batch_hidden = []
             batch_ids = []
 
-        if (i + 1) % 1000 == 0 and len(batch_hidden) > 0:
-            print(f"    {i+1}/{len(texts)} extracted")
+        if samples_done % 2000 < EXTRACT_BATCH_SIZE and len(batch_hidden) > 0:
+            elapsed = time.time() - t_extract
+            rate = samples_done / elapsed
+            eta = (len(texts) - samples_done) / max(rate, 0.01)
+            print(f"    {samples_done}/{len(texts)} ({rate:.1f} samples/s, ETA: {eta/3600:.1f}h)")
 
     # Save final batch
     if batch_hidden:
@@ -215,6 +254,9 @@ def extract_hidden_states(args):
             "input_ids": batch_ids,
         }, cache_dir / f"batch_{batch_num}.pt")
         batch_num += 1
+    
+    total_time = time.time() - t_extract
+    print(f"  Extraction complete: {total_time/3600:.1f}h, {len(texts)/total_time:.1f} samples/s")
 
     # Save embeddings
     torch.save({
