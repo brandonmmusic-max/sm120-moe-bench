@@ -439,7 +439,9 @@ def train_dflash(args):
                 # Block diffusion noise: replace masked positions with [MASK] token embedding
                 # Standard discrete diffusion — NO Gaussian noise, just mask token substitution
                 # (Arriola et al. 2025, DFlash paper Section 3.2)
-                mask_token_id = tokenizer.eos_token_id  # Use EOS as mask token
+                # DFlash uses token 248070 (<|audio_start|>) as mask — a special token
+                # outside normal vocab that never appears in real text
+                mask_token_id = 248070  # From z-lab DFlash config (dflash_config.mask_token_id)
                 mask_embedding = embed(torch.tensor([mask_token_id], device=device))  # [1, H]
                 noise_emb = torch.where(
                     mask.unsqueeze(-1).expand_as(noise_emb),
@@ -539,7 +541,7 @@ def train_dflash(args):
             config = {
                 "dflash_config": {
                     "target_layer_ids": [int(x) for x in args.target_layer_ids.split(",")],
-                    "mask_token_id": tokenizer.eos_token_id,
+                    "mask_token_id": 248070,
                     "block_size": args.block_size,
                 },
                 "trained_on": args.target_model,
