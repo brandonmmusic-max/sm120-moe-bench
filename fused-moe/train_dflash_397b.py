@@ -523,8 +523,11 @@ def train_dflash(args):
                     noise_emb,
                 )
 
+                # position_ids must cover ctx_len + q_len = 2*S because DFlash
+                # attention concatenates target_hidden + hidden_states for K/V.
+                # Q uses cos[-q_len:] (last S positions), K uses full cos (2*S).
                 B, S = tokens.shape
-                pos_ids = torch.arange(S, device=device).unsqueeze(0).expand(B, -1)
+                pos_ids = torch.arange(2 * S, device=device).unsqueeze(0).expand(B, -1)
 
                 # Forward through draft model
                 output = draft(
@@ -533,14 +536,8 @@ def train_dflash(args):
                     target_hidden=hidden,
                 )
 
-                # LM head (frozen)
-                with torch.no_grad():
-                    logits = lm_head(output.float()).to(output.dtype)
-
-                # Wait — LM head needs gradients to flow through output
-                # Actually: the output of draft model needs gradients, lm_head is linear
-                # so grad flows through even with frozen weights
-                logits = F.linear(output, lm_head.weight)  # explicit to allow grad flow
+                # LM head (frozen weights, but grad flows through output)
+                logits = F.linear(output, lm_head.weight)
 
                 # Position-weighted cross-entropy loss on masked positions
                 if mask.any():
@@ -567,7 +564,9 @@ def train_dflash(args):
                     loss = torch.tensor(0.0, device=device)
 
             if batch_idx < 3 and epoch == 0:
-                print(f"  DEBUG step {batch_idx}: loss={loss.item():.6f}, mask_any={mask.any().item()}, output shape={output.shape if hasattr(output, 'shape') else 'N/A'}")
+                print(f"  DEBUG step {batch_idx}: loss={loss.item():.6f}, mask_any={mask.any().item()}, mask_sum={mask.sum().item()}")
+                print(f"  DEBUG output: shape={output.shape}, min={output.min().item():.4f}, max={output.max().item():.4f}, has_nan={output.isnan().any().item()}")
+                print(f"  DEBUG logits: shape={logits.shape}, min={logits.min().item():.4f}, max={logits.max().item():.4f}")
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
