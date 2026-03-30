@@ -99,17 +99,19 @@ def extract_hidden_states(args):
         tokenizer.pad_token = tokenizer.eos_token
 
     # Load INT8 quantized — fits ~397GB across 4 GPUs
-    # Use native transformers Qwen3.5 support (NOT trust_remote_code, which rejects bnb kwargs)
+    # Requires transformers >= 5.2.0 for native Qwen3.5 MoE support
     from transformers import BitsAndBytesConfig
     use_vllm = False
     t0 = time.time()
     num_gpus = torch.cuda.device_count()
-    quantization_config = BitsAndBytesConfig(load_in_8bit=True)
+    bnb_config = BitsAndBytesConfig(load_in_8bit=True)
     print(f"Loading target model {args.target_model} INT8 on {num_gpus} GPUs...")
     model = AutoModelForCausalLM.from_pretrained(
         args.target_model,
-        quantization_config=quantization_config,
+        quantization_config=bnb_config,
+        torch_dtype=torch.bfloat16,
         device_map="auto",
+        trust_remote_code=True,
     )
     model.eval()
     print(f"  Model loaded in {time.time()-t0:.0f}s (INT8, {num_gpus} GPUs)")
