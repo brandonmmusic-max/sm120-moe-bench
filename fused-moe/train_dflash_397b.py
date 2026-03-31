@@ -461,19 +461,81 @@ def train_dflash(args):
     embed = nn.Embedding(vocab_size, hidden_size).to(device=device, dtype=torch.bfloat16)
 
     # Load frozen weights from target model
+    # First try cached file, then extract directly from safetensors
+    embed_loaded = False
+    head_loaded = False
     target_emb_path = cache_dir / "target_embeddings.pt"
     if target_emb_path.exists():
         target_emb = torch.load(target_emb_path)
         if target_emb["embed_weights"] is not None:
             embed.weight.data.copy_(target_emb["embed_weights"].to(torch.bfloat16))
-            embed.weight.requires_grad = False  # FREEZE per paper
-            print("  Loaded + froze target embedding weights")
+            embed.weight.requires_grad = False
+            embed_loaded = True
+            print("  Loaded + froze target embedding weights (from cache)")
         if target_emb["lm_head_weights"] is not None:
             lm_head.weight.data.copy_(target_emb["lm_head_weights"].to(torch.bfloat16))
-            lm_head.weight.requires_grad = False  # FREEZE per paper
-            print("  Loaded + froze target LM head weights")
-    else:
-        print("  WARNING: No target embeddings found, training from scratch")
+            lm_head.weight.requires_grad = False
+            head_loaded = True
+            print("  Loaded + froze target LM head weights (from cache)")
+
+    # If cache had None values, extract directly from safetensors
+    if not embed_loaded or not head_loaded:
+        print("  Extracting target embeddings from safetensors...")
+        try:
+            from safetensors import safe_open
+            from huggingface_hub import snapshot_download
+
+            model_path = snapshot_download(args.target_model, local_files_only=True)
+            index_path = os.path.join(model_path, "model.safetensors.index.json")
+            if os.path.exists(index_path):
+                with open(index_path) as f:
+                    index = json.load(f)
+                weight_map = index["weight_map"]
+
+                if not embed_loaded:
+                    for key in weight_map:
+                        if "embed_tokens.weight" in key:
+                            shard = os.path.join(model_path, weight_map[key])
+                            with safe_open(shard, framework="pt", device="cpu") as f:
+                                w = f.get_tensor(key)
+                            embed.weight.data.copy_(w[:vocab_size].to(torch.bfloat16))
+                            embed.weight.requires_grad = False
+                            embed_loaded = True
+                            print(f"  Extracted + froze target embed_tokens: {w.shape}")
+                            break
+
+                if not head_loaded:
+                    for key in weight_map:
+                        if "lm_head.weight" in key:
+                            shard = os.path.join(model_path, weight_map[key])
+                            with safe_open(shard, framework="pt", device="cpu") as f:
+                                w = f.get_tensor(key)
+                            lm_head.weight.data.copy_(w[:vocab_size].to(torch.bfloat16))
+                            lm_head.weight.requires_grad = False
+                            head_loaded = True
+                            print(f"  Extracted + froze target lm_head: {w.shape}")
+                            break
+
+                if not head_loaded and embed_loaded:
+                    lm_head.weight.data.copy_(embed.weight.data)
+                    lm_head.weight.requires_grad = False
+                    head_loaded = True
+                    print("  Using embed_tokens as lm_head (tied weights)")
+
+                # Update the cache file for next time
+                if embed_loaded or head_loaded:
+                    torch.save({
+                        "embed_weights": embed.weight.data.cpu() if embed_loaded else None,
+                        "lm_head_weights": lm_head.weight.data.cpu() if head_loaded else None,
+                    }, target_emb_path)
+                    print("  Updated target_embeddings.pt cache")
+        except Exception as e:
+            print(f"  WARNING: Safetensors extraction failed ({e})")
+
+    if not embed_loaded:
+        print("  WARNING: embed weights are RANDOM — not from target model")
+    if not head_loaded:
+        print("  WARNING: lm_head weights are RANDOM — not from target model")
 
     # Only train draft model parameters (not embed/lm_head)
     trainable_params = [p for p in draft.parameters() if p.requires_grad]
