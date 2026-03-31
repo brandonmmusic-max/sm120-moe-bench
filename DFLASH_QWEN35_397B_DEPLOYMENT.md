@@ -4,7 +4,7 @@
 
 DFlash is a novel speculative decoding method that uses a lightweight block diffusion model for parallel token drafting. This document covers deploying a custom 5-layer DFlash drafter with Qwen3.5-397B-A17B (NVFP4 quantized MoE, hybrid Mamba+attention architecture) on vLLM v0.18.x with 4x RTX PRO 6000 Blackwell GPUs (TP=4).
 
-**Key result**: Five vLLM patches were required to make DFlash work with this model. All patches, the exact Docker config, and benchmark results are documented below for full reproducibility.
+**Key result**: Seven vLLM patches were required to make DFlash work with this model. All patches, the exact Docker config, and benchmark results are documented below for full reproducibility.
 
 ## Hardware
 
@@ -180,7 +180,57 @@ if num_context > 0 and positions.shape[-1] < q.shape[0]:
 q, k = self.rotary_emb(positions, q, k)
 ```
 
-Context tokens get position 0 (dummy) since their positional information is already encoded in the hidden states from the target model. The rotary embedding for context tokens is effectively a no-op since `q = q[num_context:]` strips them immediately after.
+Context tokens need positions covering the CUDA graph padding. The eagle.py proposer sets `positions_len = ctx_len + num_input_tokens` (padded) and fills padding slots with the last valid position value.
+
+### Patch 6: Mask Token ID Mismatch
+
+**File**: `vllm/v1/spec_decode/eagle.py`
+
+**Problem**: vLLM hardcodes `dflash_mask_token_id = 151669` at line 171. The DFlash draft model was trained with mask token **248070** (`<|audio_start|>` in Qwen3 tokenizer), specified in `dflash_config.mask_token_id`. Every masked input position receives the wrong embedding vector, corrupting all draft predictions.
+
+**Error**: No crash -- but 0% acceptance rate because every drafted token is based on wrong input features.
+
+**Fix**: Read `mask_token_id` from the draft model's `dflash_config`:
+```python
+# Replace hardcoded: self.dflash_mask_token_id: int = 151669
+_dfc = getattr(
+    self.vllm_config.speculative_config.draft_model_config.hf_config,
+    "dflash_config", {}
+)
+_mid = _dfc.get("mask_token_id", 248070) if isinstance(_dfc, dict) else getattr(_dfc, "mask_token_id", 248070)
+self.dflash_mask_token_id: int = _mid
+```
+
+### Patch 7: FlashInfer Backend Ignores `causal=False`
+
+**File**: `vllm/v1/attention/backends/flashinfer.py`
+
+**Problem**: DFlash uses **bidirectional attention** (`is_causal=False`) -- all draft tokens can attend to each other and to context. vLLM's `set_dflash_first_pass()` correctly sets `causal=False` on the attention metadata, but the FlashInfer backend **hardcodes `causal=True`** at lines 1094 and 1179, silently ignoring the metadata flag. With causal masking, draft token at position 5 cannot see tokens 6-15, destroying the bidirectional attention pattern the model was trained with.
+
+**Error**: No crash -- but 0% acceptance rate because attention patterns are fundamentally wrong.
+
+**Fix**: Replace hardcoded `causal=True` with metadata-driven value at lines 1094 and 1179:
+```python
+# Replace: causal=True,
+causal=getattr(attn_metadata, 'causal', True),
+```
+
+**Alternative**: Use `--attention-backend flash_attn` which correctly reads the `causal` field from metadata at line 375.
+
+**Note**: The `flash_attn` backend (line 375 of `flash_attn.py`) properly reads `common_attn_metadata.causal` and passes it through. Only FlashInfer has this bug. Other backends (triton, ROCm) also hardcode `causal=True` but are not used on this hardware.
+
+## Confirmed Non-Issues (Investigated and Ruled Out)
+
+| Investigated | Finding |
+|---|---|
+| NVFP4 quantization divergence | Minimal -- extraction layers [2,14,26,38,50] all use Mamba-style linear_attn which is 100% bf16. Only MoE routed experts are FP4. Residual stream in bf16. |
+| Layer index off-by-one | No mismatch -- HF `hidden_states[2]` = after layer 1, vLLM `layer_idx=2` before layer 2 = after layer 1. Same. |
+| Weight loading / TP sharding | All correct -- QKV, MLP, fc, lm_head, embed_tokens all properly sharded and shared. |
+| Attention causality setting | `set_dflash_first_pass` correctly sets `causal=False` -- the bug is in FlashInfer ignoring it. |
+| rope_theta | Draft model uses its own rotary embedding (10000). Both training and inference use draft config. |
+| Hidden state concatenation order | Matches training -- layers concatenated in order [2,14,26,38,50] along dim=-1. |
+| lm_head / embed_tokens sharing | Correctly shared from target model, confirmed in logs. |
+| Rejection sampler | Correct greedy comparison for greedy decoding. Not spurious. |
 
 ## V2 Model Runner Compatibility Notes
 
@@ -300,7 +350,9 @@ The image includes custom K=64 CUTLASS kernels for SM120 (Blackwell):
 | `NotImplementedError: page size not divisible` | Mamba + DFlash KV cache page mismatch | Patch 2 |
 | `AssertionError` in `get_uniform_page_size` | Multiple page sizes after unification | Patch 3 |
 | `RuntimeError: mat1 and mat2 shapes cannot be multiplied (Nx12288 and 20480x4096)` | Wrong aux layers (3 fallback vs 5 DFlash) | Patch 4 + add `eagle_aux_hidden_state_layer_ids` to config |
-| `RuntimeError: shape '[N, -1, 128]' is invalid for input of size M` | DFlash attention positions don't cover context tokens | Patch 5 |
+| `RuntimeError: shape '[N, -1, 128]' is invalid for input of size M` | DFlash attention positions don't cover CUDA graph padded tokens | Patch 5 (eagle.py positions_len) |
+| 0% acceptance rate, no crash | Hardcoded mask_token_id=151669 instead of config's 248070 | Patch 6 |
+| 0% acceptance rate, no crash | FlashInfer hardcodes causal=True, ignoring DFlash's causal=False | Patch 7 (or use --attention-backend flash_attn) |
 | `argument --speculative-config: Value method:dflash cannot be converted` | JSON quoting in bash | Use heredoc or single-quoted JSON |
 
 ## Discovery Timeline
@@ -313,7 +365,11 @@ The image includes custom K=64 CUTLASS kernels for SM120 (Blackwell):
 
 4. **Two model runner code paths** - Discovered `vllm/v1/worker/gpu/model_runner.py` (V1, active) and `vllm/v1/worker/gpu_model_runner.py` (legacy). Both need the dflash_config reading patch. The V1 path calls `eagle3_utils.set_eagle3_aux_hidden_state_layers()` at line 282.
 
-5. **Rotary embedding positions mismatch** - After fixing aux layers, new crash: `shape '[34, -1, 128]' is invalid for input of size 41984`. DFlash attention concatenates context_states (7 tokens from 5 aux layers) with hidden_states (34 draft tokens) = 41 total, but positions only has 34 entries. Fix: prepend zero-positions for context tokens before rotary_emb.
+5. **Rotary embedding positions mismatch** - After fixing aux layers, new crash: `shape '[34, -1, 128]' is invalid for input of size 41984`. Root cause: CUDA graph padding increases `num_input_tokens` (draft) from 17 to 24, but `positions_len` still uses unpadded `num_kv_tokens = 17 + 17 = 34`. Concat produces 17 + 24 = 41 tokens but positions only has 34. Fix: `positions_len = ctx_len + num_input_tokens` (padded) in eagle.py.
+
+6. **Mask token ID mismatch (0% acceptance)** - Server running, generating tokens, but 0% acceptance rate. Multi-agent investigation found vLLM hardcodes `dflash_mask_token_id = 151669` but the draft model was trained with mask token 248070 (`dflash_config.mask_token_id`). Every masked input position gets the wrong embedding. Fix: read from draft model config.
+
+7. **FlashInfer causal=True hardcoding (0% acceptance)** - DFlash requires bidirectional attention (`is_causal=False`). `set_dflash_first_pass` correctly sets `causal=False` on metadata, but FlashInfer backend ignores it at lines 1094 and 1179. All draft tokens get causal masking instead of bidirectional, destroying the attention pattern the model was trained with. Fix: `causal=getattr(attn_metadata, 'causal', True)`.
 
 ## Files
 
