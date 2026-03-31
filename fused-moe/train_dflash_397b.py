@@ -111,12 +111,50 @@ def extract_hidden_states(args):
     model.eval()
     print(f"  Model loaded in {time.time()-t0:.0f}s (BF16, {num_gpus} GPUs)")
 
-    # Extract embeddings
-    # Skip embedding extraction from target — we'll use the draft model's embeddings
-    # (GPTQ quantized tensors deadlock on .cpu().clone())
+    # Extract embed_tokens and lm_head directly from safetensors (fast, no GPU needed)
     embed_weights = None
     lm_head_weights = None
-    print("  Skipping target embedding extraction (will use draft model embeddings in Phase 2)")
+    try:
+        from safetensors import safe_open
+        from huggingface_hub import snapshot_download
+        import glob as glob_mod
+
+        # Find cached model directory
+        model_path = snapshot_download(args.target_model, local_files_only=True)
+        index_path = os.path.join(model_path, "model.safetensors.index.json")
+        if os.path.exists(index_path):
+            with open(index_path) as f:
+                index = json.load(f)
+            weight_map = index["weight_map"]
+
+            # Find embed_tokens shard
+            embed_key = None
+            head_key = None
+            for key in weight_map:
+                if "embed_tokens.weight" in key:
+                    embed_key = key
+                if "lm_head.weight" in key:
+                    head_key = key
+
+            if embed_key:
+                shard = os.path.join(model_path, weight_map[embed_key])
+                with safe_open(shard, framework="pt", device="cpu") as f:
+                    embed_weights = f.get_tensor(embed_key).clone()
+                print(f"  Extracted target embed_tokens: {embed_weights.shape}")
+
+            if head_key:
+                shard = os.path.join(model_path, weight_map[head_key])
+                with safe_open(shard, framework="pt", device="cpu") as f:
+                    lm_head_weights = f.get_tensor(head_key).clone()
+                print(f"  Extracted target lm_head: {lm_head_weights.shape}")
+
+            if lm_head_weights is None and embed_weights is not None:
+                lm_head_weights = embed_weights.clone()
+                print(f"  Using embed_tokens as lm_head (tied weights): {lm_head_weights.shape}")
+        else:
+            print("  WARNING: No safetensors index found, trying direct model access")
+    except Exception as e:
+        print(f"  WARNING: Fast embedding extraction failed ({e}), embeddings will be random")
 
     # Load training data
     print("Loading training datasets...")
