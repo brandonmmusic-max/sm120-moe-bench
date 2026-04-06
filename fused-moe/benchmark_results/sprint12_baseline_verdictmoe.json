@@ -1,0 +1,47 @@
+{
+  "metadata": {
+    "version": "0.3.0",
+    "engine": "vllm",
+    "model": "qwen3.5-397b-nvfp4",
+    "server": "localhost:9200",
+    "timestamp": "2026-04-05T22:37:32.628302",
+    "duration_per_test": 30.0,
+    "max_tokens": 2048,
+    "max_total_tokens": 0,
+    "concurrency_levels": [
+      1
+    ],
+    "context_lengths": [
+      0
+    ]
+  },
+  "prefill": {},
+  "results": [
+    {
+      "concurrency": 1,
+      "context_tokens": 0,
+      "aggregate_tps": 139.31247038999985,
+      "per_request_avg_tps": 139.31247038999985,
+      "ttft_avg": 0.15919282699996984,
+      "ttft_p50": 0.15919282699996984,
+      "ttft_p99": 0.15919282699996984,
+      "total_tokens": 4096,
+      "wall_time": 33.72403741200014,
+      "num_completed": 1,
+      "num_errors": 0,
+      "server_gen_throughput": 139.31247038999985,
+      "server_utilization": 0.015476190476190421,
+      "server_spec_accept_rate": 1723.0,
+      "avg_running_reqs": 1,
+      "max_running_reqs": 1,
+      "avg_queue_reqs": 0,
+      "max_queue_reqs": 0,
+      "queue_fraction": 0.0
+    }
+  ],
+  "summary_table": {
+    "0": {
+      "1": 139.31247038999985
+    }
+  }
+}

@@ -101,11 +101,14 @@ def _get_verdict_ext():
     return _verdict_ext
 
 
-def _get_verdict_mma_ext():
-    """Load the single fused cooperative kernel extension (SM120).
+_use_tma = os.environ.get("VERDICT_USE_TMA", "1") == "1"
 
-    ONE kernel launch: BF16→FP4 → GEMM1 → SwiGLU → requant → GEMM2 → BF16.
-    Atomic barriers, CUDA-graph safe, no cooperative_groups.
+def _get_verdict_mma_ext():
+    """Load the fused cooperative kernel extension (SM120).
+
+    If VERDICT_USE_TMA=1 (default), loads the TMA variant with
+    cp.async.bulk.tensor.3d for weight loads + PDL. Falls back to
+    scalar-load variant if TMA source not found.
     """
     global _verdict_mma_ext
     if _verdict_mma_ext is not None:
@@ -114,8 +117,25 @@ def _get_verdict_mma_ext():
     from torch.utils.cpp_extension import load
 
     csrc_dir = Path(__file__).parent / "csrc"
-    ext_src = csrc_dir / "verdict_fused_cooperative_ext.cu"
 
+    # Try TMA variant first
+    tma_src = csrc_dir / "verdict_fused_cooperative_tma_ext.cu"
+    if _use_tma and tma_src.exists():
+        logger.info(
+            "JIT-compiling VerdictMoE TMA+PDL cooperative extension (SM120)...")
+        _verdict_mma_ext = load(
+            name="verdict_fused_cooperative_tma_ext",
+            sources=[str(tma_src)],
+            extra_cuda_cflags=_CUDA_FLAGS,
+            extra_ldflags=["-lcuda"],
+            verbose=False,
+        )
+        logger.info(
+            "VerdictMoE TMA+PDL cooperative extension compiled successfully")
+        return _verdict_mma_ext
+
+    # Fallback to scalar-load variant
+    ext_src = csrc_dir / "verdict_fused_cooperative_ext.cu"
     if not ext_src.exists():
         raise FileNotFoundError(
             f"VerdictMoE fused cooperative CUDA source not found: {ext_src}")
@@ -576,6 +596,24 @@ class VerdictMoEExperts(mk.FusedMoEExpertsModular):
     # M > 4 (warmup/prefill): per-token loop, each launch topk pairs.
     # Both paths use same kernel, CUDA-graph safe, atomic barriers.
     # ========================================================================
+    def _ensure_tma_descriptors(self, ext_coop, w1, w2):
+        """Lazily create and cache TMA weight descriptors."""
+        if not _use_tma or not hasattr(ext_coop, 'forward_tma'):
+            return
+        w1_ptr = w1.data_ptr()
+        w2_ptr = w2.data_ptr()
+        if hasattr(self, '_tma_w1_ptr') and self._tma_w1_data_ptr == w1_ptr:
+            return  # already created for these weights
+        # w1: [E, 2*N_half, K/2], w2: [E, K, N_half/2]
+        # TMA needs 3D tensors with box = (BK/2=32, BN=64, 1)
+        BK_BYTES = 32  # BK/2
+        BN = 64
+        self._tma_w1_ptr = ext_coop.create_tma_weight_descriptor(w1, BK_BYTES, BN)
+        self._tma_w2_ptr = ext_coop.create_tma_weight_descriptor(w2, BK_BYTES, BN)
+        self._tma_w1_data_ptr = w1_ptr
+        logger.info("VerdictMoE TMA descriptors created (w1=%d, w2=%d)",
+                     self._tma_w1_ptr, self._tma_w2_ptr)
+
     def _apply_mma(
         self, output, hidden_states, w1, w2,
         w1_sf, w2_sf, w1_alpha, w2_alpha,
@@ -585,6 +623,7 @@ class VerdictMoEExperts(mk.FusedMoEExpertsModular):
         topk_ids, topk_weights, apply_router_weight_on_input,
     ):
         ext_coop = _get_verdict_mma_ext()
+        self._ensure_tma_descriptors(ext_coop, w1, w2)
 
         topk = num_active // m  # experts per token
         k_packed = k // 2
@@ -602,7 +641,7 @@ class VerdictMoEExperts(mk.FusedMoEExpertsModular):
             inter_sf = self._buf_inter_sf[:num_pairs * n_half_sf]
             pair_output_f32 = self._buf_pair_output_f32[:num_pairs * k]
 
-            ext_coop.forward(
+            _fwd_args = (
                 hidden_states.contiguous(),
                 w1.contiguous(),
                 w1_sf.contiguous(),
@@ -624,6 +663,10 @@ class VerdictMoEExperts(mk.FusedMoEExpertsModular):
                 self._buf_barrier,
                 k, N_half, num_pairs,
             )
+            if hasattr(self, '_tma_w1_ptr') and hasattr(ext_coop, 'forward_tma'):
+                ext_coop.forward_tma(*_fwd_args, self._tma_w1_ptr, self._tma_w2_ptr)
+            else:
+                ext_coop.forward(*_fwd_args)
         else:
             # --- PER-TOKEN LOOP: M>4 (warmup/prefill), M=1 per launch ---
             input_fp4 = self._buf_input_fp4[:k_packed]
@@ -642,7 +685,7 @@ class VerdictMoEExperts(mk.FusedMoEExpertsModular):
                 tok_w2a = w2_alpha[tok * topk:(tok + 1) * topk]
                 tok_wts = wts_for_kernel[tok * topk:(tok + 1) * topk]
 
-                ext_coop.forward(
+                _fwd_args_tok = (
                     hidden_states[tok:tok + 1].contiguous(),
                     w1.contiguous(),
                     w1_sf.contiguous(),
@@ -664,3 +707,7 @@ class VerdictMoEExperts(mk.FusedMoEExpertsModular):
                     self._buf_barrier,
                     k, N_half, topk,
                 )
+                if hasattr(self, '_tma_w1_ptr') and hasattr(ext_coop, 'forward_tma'):
+                    ext_coop.forward_tma(*_fwd_args_tok, self._tma_w1_ptr, self._tma_w2_ptr)
+                else:
+                    ext_coop.forward(*_fwd_args_tok)
