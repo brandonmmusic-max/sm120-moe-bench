@@ -23,6 +23,10 @@
  *   Phase 1: 3 remote writes per GPU (12 total, all parallel). Local reduce after arrival.
  *   Phase 2: 3 remote writes per GPU (12 total, all parallel). No reduce needed.
  *
+ * Launch barrier: pure posted-write barrier (no system-scope atomics, which are
+ * broken on SM 12.0 Blackwell for cross-GPU targets). Each GPU writes its arrival
+ * flag to every peer's local flag array, then polls its own local array.
+ *
  * Compile: nvcc -O2 -arch=sm_120a -std=c++17 write_based_allreduce.cu -o write_based_allreduce
  */
 
@@ -115,14 +119,6 @@ __nv_bfloat16* get_output(void* base, int N) {
 // ============================================================================
 // Each GPU runs this kernel with 1 block (to avoid inter-CTA sync complexity).
 // The block handles the full reduce-scatter + allgather for this GPU's rank.
-//
-// Parameters:
-//   input:       this GPU's input data (N BF16 elements)
-//   local_base:  this GPU's allreduce buffer (staging + flags + output)
-//   remote_bases[4]: each peer's allreduce buffer as mapped into this GPU's VA space
-//   rank:        this GPU's rank (0-3)
-//   N:           total number of BF16 elements
-//   iteration:   monotonically increasing counter for flag values
 
 __global__ void write_allreduce_kernel(
     const __nv_bfloat16* __restrict__ input,
@@ -133,7 +129,15 @@ __global__ void write_allreduce_kernel(
     void* remote_base_3,
     int rank,
     int N,
-    uint32_t iteration)
+    uint32_t iteration,
+    // Per-GPU barrier flag arrays: barrier_flags_X points to GPU X's local
+    // array of NUM_GPUS uint32s. GPU i writes barrier_flags_j[i] = iteration
+    // to tell GPU j "I'm here" (posted write). GPU j polls barrier_flags_j[*]
+    // locally until all entries match iteration.
+    volatile uint32_t* barrier_flags_0,
+    volatile uint32_t* barrier_flags_1,
+    volatile uint32_t* barrier_flags_2,
+    volatile uint32_t* barrier_flags_3)
 {
     // Pack remote bases into array for indexing
     void* remote_bases[4];
@@ -141,6 +145,13 @@ __global__ void write_allreduce_kernel(
     remote_bases[1] = remote_base_1;
     remote_bases[2] = remote_base_2;
     remote_bases[3] = remote_base_3;
+
+    // Pack barrier flag arrays for indexing
+    volatile uint32_t* barrier_flags[4];
+    barrier_flags[0] = barrier_flags_0;
+    barrier_flags[1] = barrier_flags_1;
+    barrier_flags[2] = barrier_flags_2;
+    barrier_flags[3] = barrier_flags_3;
 
     const int chunk = N / NUM_GPUS;
     const int tid = threadIdx.x;
@@ -150,18 +161,32 @@ __global__ void write_allreduce_kernel(
     const int chunk_f4 = chunk / 8;  // chunk in float4 units
 
     // ========================================================================
+    // Launch barrier: pure posted-write, no atomics
+    // ========================================================================
+    // Each GPU writes its arrival to ALL peers' local flag arrays (posted writes),
+    // then polls its OWN local flag array until all NUM_GPUS entries match iteration.
+    // This avoids system-scope atomics which are broken on SM 12.0 Blackwell
+    // for cross-GPU memory targets.
+    if (tid == 0) {
+        // Signal arrival to all GPUs (including self)
+        #pragma unroll
+        for (int g = 0; g < NUM_GPUS; g++) {
+            barrier_flags[g][rank] = iteration;
+        }
+        // Poll our own local flags until all GPUs have arrived
+        #pragma unroll
+        for (int g = 0; g < NUM_GPUS; g++) {
+            while (barrier_flags[rank][g] != iteration) {
+                // spin on LOCAL memory — no PCIe traffic
+            }
+        }
+    }
+    __syncthreads();
+
+    // ========================================================================
     // Phase 1: ReduceScatter via posted writes
     // ========================================================================
     // Each GPU writes its data to every peer's staging buffer.
-    // We write the FULL input (not just a chunk) because each peer needs our
-    // contribution to their chunk. Actually, for reduce-scatter, each peer only
-    // needs the chunk they own. So GPU_rank writes chunk[peer_chunk_idx] to
-    // peer's staging slot.
-    //
-    // Peer slot assignment: peer maps rank to slot 0,1,2 (skipping self)
-    // E.g., for peer=1: rank 0 -> slot 0, rank 2 -> slot 1, rank 3 -> slot 2
-
-    // Write our chunks to each peer's staging
     // For peer p, write input[p*chunk .. (p+1)*chunk-1] to peer's staging[slot]
     // where slot = rank < p ? rank : rank - 1
 
@@ -209,14 +234,10 @@ __global__ void write_allreduce_kernel(
     // ========================================================================
     // Local reduce: our chunk = input[rank*chunk..] + staging[0..2]
     // ========================================================================
-    // We reduce our own chunk: input[rank*chunk..] is our local contribution,
-    // plus 3 staging buffers from peers.
 
     __nv_bfloat16* my_output = get_output(local_base, N);
     const __nv_bfloat16* my_input_chunk = input + rank * chunk;
 
-    // For the reduce, we do all 4 additions (our input + 3 staging slots)
-    // Using float accumulation for precision
     for (int i = tid; i < chunk; i += nthreads) {
         float acc = __bfloat162float(my_input_chunk[i]);
         #pragma unroll 3
@@ -224,7 +245,6 @@ __global__ void write_allreduce_kernel(
             __nv_bfloat16* stg = get_staging(local_base, s, chunk);
             acc += __bfloat162float(stg[i]);
         }
-        // Write reduced chunk to our output at the correct offset
         my_output[rank * chunk + i] = __float2bfloat16(acc);
     }
     __syncthreads();
@@ -232,14 +252,12 @@ __global__ void write_allreduce_kernel(
     // ========================================================================
     // Phase 2: AllGather via posted writes
     // ========================================================================
-    // Each GPU writes its reduced chunk to every peer's output buffer.
 
     __nv_bfloat16* my_reduced_chunk = my_output + rank * chunk;
 
     for (int peer = 0; peer < NUM_GPUS; peer++) {
         if (peer == rank) continue;
 
-        // Write our reduced chunk to peer's output at offset [rank*chunk]
         __nv_bfloat16* dst = get_output(remote_bases[peer], N) + rank * chunk;
         const float4* src4 = (const float4*)my_reduced_chunk;
         float4* dst4 = (float4*)dst;
@@ -290,6 +308,10 @@ struct AllReduceContext {
     __nv_bfloat16* input_buf[NUM_GPUS]; // input data per GPU
     cudaStream_t streams[NUM_GPUS];
 
+    // Per-GPU barrier flag arrays: barrier_flags[g] points to an array of
+    // NUM_GPUS uint32s allocated on GPU g's memory.
+    uint32_t* barrier_flags[NUM_GPUS];
+
     void init(int n) {
         N = n;
         alloc_size = compute_alloc_size(N);
@@ -315,13 +337,12 @@ struct AllReduceContext {
             // Alloc input buffer
             CHECK_CUDA(cudaMalloc(&input_buf[i], N * sizeof(__nv_bfloat16)));
 
+            // Alloc barrier flag array (NUM_GPUS uint32s, on this GPU's memory)
+            CHECK_CUDA(cudaMalloc(&barrier_flags[i], NUM_GPUS * sizeof(uint32_t)));
+            CHECK_CUDA(cudaMemset(barrier_flags[i], 0, NUM_GPUS * sizeof(uint32_t)));
+
             CHECK_CUDA(cudaStreamCreate(&streams[i]));
         }
-
-        // Single-process P2P: after cudaDeviceEnablePeerAccess, gpu_alloc[owner]
-        // pointers are directly usable from any peer GPU via CUDA UVA.
-        // The hardware routes stores through PCIe BAR as posted writes.
-        // No IPC handles needed (those are for multi-process).
 
         printf("AllReduce context initialized:\n");
         printf("  N = %d BF16 elements (%d bytes = %.1f KB)\n",
@@ -332,7 +353,6 @@ struct AllReduceContext {
     }
 
     void fill_input(float* rank_values) {
-        // Fill each GPU's input with rank-specific data for correctness checks
         for (int g = 0; g < NUM_GPUS; g++) {
             CHECK_CUDA(cudaSetDevice(g));
             std::vector<__nv_bfloat16> host_data(N);
@@ -345,33 +365,40 @@ struct AllReduceContext {
     }
 
     void reset_flags() {
-        // Zero out all flags before each allreduce call
+        // Zero out all flags and barrier arrays
         for (int g = 0; g < NUM_GPUS; g++) {
             CHECK_CUDA(cudaSetDevice(g));
             int chunk = N / NUM_GPUS;
             size_t staging_bytes = 3 * chunk * sizeof(__nv_bfloat16);
             staging_bytes = (staging_bytes + 255) & ~255ULL;
-            // Zero just the flags region (6 uint32s, but zero a full 256-byte aligned block)
             CHECK_CUDA(cudaMemset((char*)gpu_alloc[g] + staging_bytes, 0, 256));
+            // Reset barrier flags (no need for cross-GPU sync — each is on own GPU)
+            CHECK_CUDA(cudaMemset(barrier_flags[g], 0, NUM_GPUS * sizeof(uint32_t)));
+        }
+        // Synchronize all GPUs to ensure resets are complete before kernel launch
+        for (int g = 0; g < NUM_GPUS; g++) {
+            CHECK_CUDA(cudaSetDevice(g));
+            CHECK_CUDA(cudaDeviceSynchronize());
         }
     }
 
     void launch_allreduce(uint32_t iteration) {
-        // Launch kernel on all 4 GPUs concurrently
         int threads = 256;
 
         for (int g = 0; g < NUM_GPUS; g++) {
             CHECK_CUDA(cudaSetDevice(g));
 
-            // With P2P enabled, gpu_alloc[i] pointers are valid from any GPU
-            // via CUDA UVA. Stores to remote pointers become PCIe posted writes.
             write_allreduce_kernel<<<1, threads, 0, streams[g]>>>(
                 input_buf[g],
-                gpu_alloc[g],   // local_base (this GPU's own memory)
+                gpu_alloc[g],
                 gpu_alloc[0], gpu_alloc[1], gpu_alloc[2], gpu_alloc[3],
-                g,              // rank
+                g,
                 N,
-                iteration
+                iteration,
+                (volatile uint32_t*)barrier_flags[0],
+                (volatile uint32_t*)barrier_flags[1],
+                (volatile uint32_t*)barrier_flags[2],
+                (volatile uint32_t*)barrier_flags[3]
             );
         }
     }
@@ -383,7 +410,6 @@ struct AllReduceContext {
         }
     }
 
-    // Host-side output pointer computation (mirrors __device__ get_output)
     __nv_bfloat16* host_get_output(void* base) {
         int chunk = N / NUM_GPUS;
         size_t staging_bytes = 3 * chunk * sizeof(__nv_bfloat16);
@@ -392,7 +418,6 @@ struct AllReduceContext {
         return (__nv_bfloat16*)((char*)base + staging_bytes + flags_bytes);
     }
 
-    // Read output from GPU g
     void read_output(int g, __nv_bfloat16* host_out) {
         CHECK_CUDA(cudaSetDevice(g));
         __nv_bfloat16* dev_output = host_get_output(gpu_alloc[g]);
@@ -405,6 +430,7 @@ struct AllReduceContext {
             CHECK_CUDA(cudaSetDevice(g));
             CHECK_CUDA(cudaFree(gpu_alloc[g]));
             CHECK_CUDA(cudaFree(input_buf[g]));
+            CHECK_CUDA(cudaFree(barrier_flags[g]));
             CHECK_CUDA(cudaStreamDestroy(streams[g]));
         }
     }
@@ -449,9 +475,6 @@ bool validate(AllReduceContext& ctx, float expected_sum) {
 void benchmark(AllReduceContext& ctx, int N, const char* label) {
     printf("--- %s (N=%d, %d bytes, %.1f KB) ---\n", label, N, N * 2, N * 2 / 1024.0);
 
-    // Re-init with new N
-    // (We assume ctx is already initialized with this N)
-
     float rank_vals[4] = {1.0f, 2.0f, 3.0f, 4.0f};
     float expected = 10.0f;  // 1+2+3+4
 
@@ -468,16 +491,15 @@ void benchmark(AllReduceContext& ctx, int N, const char* label) {
         return;
     }
 
-    // Warmup
+    // Warmup — no need to reset flags between iterations since iteration
+    // counter is monotonically increasing and flags are checked with ==.
+    // Input data is the same every time (rank values don't change).
     for (uint32_t i = 2; i < 2 + WARMUP_ITERS; i++) {
-        ctx.fill_input(rank_vals);
-        ctx.reset_flags();
         ctx.launch_allreduce(i);
         ctx.sync_all();
     }
 
     // Timed runs
-    // Use CUDA events on GPU 0 for end-to-end timing
     cudaEvent_t start, stop;
     CHECK_CUDA(cudaSetDevice(0));
     CHECK_CUDA(cudaEventCreate(&start));
@@ -487,10 +509,8 @@ void benchmark(AllReduceContext& ctx, int N, const char* label) {
     uint32_t iter_base = 2 + WARMUP_ITERS;
 
     for (int i = 0; i < BENCH_ITERS; i++) {
-        ctx.fill_input(rank_vals);
-        ctx.reset_flags();
-
-        // Sync all GPUs before starting
+        // No reset needed — monotonic iteration counter handles flag matching.
+        // No fill_input needed — same data every time.
         ctx.sync_all();
 
         CHECK_CUDA(cudaSetDevice(0));
@@ -498,11 +518,9 @@ void benchmark(AllReduceContext& ctx, int N, const char* label) {
 
         ctx.launch_allreduce(iter_base + i);
 
-        // Record stop on GPU 0 after its kernel completes
         CHECK_CUDA(cudaSetDevice(0));
         CHECK_CUDA(cudaEventRecord(stop, ctx.streams[0]));
 
-        // Wait for all GPUs (the allreduce needs all to finish)
         ctx.sync_all();
 
         CHECK_CUDA(cudaEventElapsedTime(&times[i], start, stop));
@@ -557,7 +575,6 @@ int main(int argc, char** argv) {
     printf("Protocol: ReduceScatter + AllGather, all posted writes, local polling\n");
     printf("Target: <10us for 8KB (hidden_size=4096 BF16)\n\n");
 
-    // Verify we have 4 GPUs with P2P
     int dev_count;
     CHECK_CUDA(cudaGetDeviceCount(&dev_count));
     if (dev_count < NUM_GPUS) {
@@ -565,7 +582,6 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // Print GPU info
     for (int i = 0; i < NUM_GPUS; i++) {
         cudaDeviceProp prop;
         CHECK_CUDA(cudaGetDeviceProperties(&prop, i));
@@ -573,7 +589,6 @@ int main(int argc, char** argv) {
                i, prop.name, prop.major, prop.minor, prop.multiProcessorCount);
     }
 
-    // Verify P2P access
     printf("\nP2P access matrix:\n");
     for (int i = 0; i < NUM_GPUS; i++) {
         printf("  GPU %d:", i);
@@ -592,7 +607,6 @@ int main(int argc, char** argv) {
     printf("\n");
 
     // Benchmark various sizes
-    // hidden_size=4096 BF16 = 8KB (Qwen3.5 hidden dim)
     int sizes[] = {4096, 8192, 16384, 32768};
     const char* labels[] = {"4096 BF16 = 8KB", "8192 BF16 = 16KB",
                             "16384 BF16 = 32KB", "32768 BF16 = 64KB"};
