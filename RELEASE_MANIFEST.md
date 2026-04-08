@@ -63,10 +63,22 @@
 
 **Status**: Infrastructure works, model quality insufficient. PR not recommended unless someone trains a better drafter.
 
-### NOT PR-worthy (Internal Optimizations)
-- Write-based P2P AllReduce — too hardware-specific (PCIe 5.0, 4 GPUs), better as a standalone tool
-- MegaKernel — research prototype, not production-ready
+### PR 4 (Community): Write-Based P2P AllReduce for PCIe Multi-GPU
+**Repo**: Standalone or vllm-project/vllm  
+**Priority**: High — any PCIe multi-GPU setup benefits  
+**Results**: 8.4μs at 8KB (1.66x faster than NCCL SymmMem)  
+**Bug report**: atomicAdd_system broken on SM 12.0 for cross-GPU targets — should be filed with NVIDIA
+
+### NOT PR-worthy (Internal)
+- MegaKernel — research prototype, architecture decision changed to hybrid approach
 - Expert profiling / gate weight analysis — analysis results, not code
+
+## Research References Found
+- FlashFormer (arXiv:2505.22758): whole-model kernels, atomic barriers
+- Mirage MPK (arXiv:2512.22219): worker-scheduler SMs, 1-2μs task transitions
+- ParallelKittens (arXiv:2511.13940): PGL for multi-GPU, NVLink required
+- Cursor Warp Decode (cursor.com/blog/warp-decode): neuron-centric MoE, 1.84x on Blackwell
+- FlashMoE (NeurIPS 2025): persistent MoE + RDMA fusion
 
 ---
 
