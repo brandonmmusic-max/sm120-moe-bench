@@ -119,8 +119,9 @@ __device__ __forceinline__ void load_paged_tile(
             const int page_idx = kv_pos / block_size;
             const int page_off = kv_pos % block_size;
             const int blk = block_table[seq_idx * max_blocks_per_seq + page_idx];
-            // HND layout: [num_blocks, num_kv_heads, block_size, head_dim]
-            const int src = blk * kv_block_stride + (kv_head * block_size + page_off) * HEAD_DIM + d;
+            // Physical layout is NHD even after HND permute (strides handle reorder)
+            // NHD: [num_blocks, block_size, num_kv_heads, head_dim]
+            const int src = blk * kv_block_stride + (page_off * num_kv_heads + kv_head) * HEAD_DIM + d;
             cp_async_16B(&kv_smem[kv_local * HEAD_DIM + d], &cache[src]);
         } else {
             // Zero-fill out-of-bounds positions (16 bytes regardless of dtype)
@@ -218,7 +219,7 @@ tiled_split_kv_partial_paged(
     const int sub_tid     = tid % R;
     const int d_start_qk  = sub_tid * D_PER_THREAD;
 
-    // Online softmax state (match FlashInfer: m=-5e4, d=1.0)
+    // Online softmax state (log-base-2 domain, matches FlashInfer state_t: m=-inf, d=1.0)
     float rowmax = NEG_INF;
     float rowsum = 1.0f;
     float o_val  = 0.0f;
@@ -247,8 +248,10 @@ tiled_split_kv_partial_paged(
         // ==============================================================
         // Step 2: Q @ K^T -- compute BLOCK_KV scores
         // ==============================================================
+        // All threads compute dot (zero-filled K gives 0 for OOB positions).
+        // Shuffle reduction MUST run unconditionally — all warp threads participate.
         float dot = 0.0f;
-        if (score_idx < tile_len) {
+        {
             const kv_dtype_t<FP8_KV>* k_row = &kv_smem[score_idx * HEAD_DIM + d_start_qk];
             const float* q_row = &q_smem[d_start_qk];
 
@@ -257,7 +260,7 @@ tiled_split_kv_partial_paged(
                 dot += q_row[d] * kv_to_float(k_row[d]);
             }
 
-            // Reduce within R-thread group via shuffle
+            // Reduce within R-thread group via shuffle (unconditional — all threads)
             if constexpr (R >= 2) dot += __shfl_xor_sync(0xffffffff, dot, 1);
             if constexpr (R >= 4) dot += __shfl_xor_sync(0xffffffff, dot, 2);
             if constexpr (R >= 8) dot += __shfl_xor_sync(0xffffffff, dot, 4);
@@ -282,7 +285,7 @@ tiled_split_kv_partial_paged(
 
         // ==============================================================
         // Step 4: Online softmax (thread 0, overlapped with V load)
-        //         All values in log-base-2 domain; use ptx_exp2
+        //         Log-base-2 domain — matches FlashInfer state_t
         // ==============================================================
         if (tid == 0) {
             float tile_max = NEG_INF;
@@ -335,8 +338,8 @@ tiled_split_kv_partial_paged(
 
     // ==============================================================
     // Normalize and write partial results
-    // Match FlashInfer: rcp.approx for division, base-2 LSE
-    // v_scale is NOT applied here — applied post-kernel in Python (matches FlashInfer)
+    // Normalize output (log-base-2 domain, ptx_rcp matches FlashInfer OutputTransform)
+    // v_scale applied post-kernel in Python
     // ==============================================================
     {
         float d_rcp = (rowmax != NEG_INF) ? ptx_rcp(rowsum) : 0.f;
@@ -347,7 +350,7 @@ tiled_split_kv_partial_paged(
         partial_O[split_idx * total_heads * HEAD_DIM + head_linear * HEAD_DIM + tid] = o_val;
 
     if (tid == 0) {
-        // Base-2 LSE: m_log2 + log2(d), matching FlashInfer's state_t::get_lse()
+        // Log-base-2 LSE: m + log2(d), matching FlashInfer state_t::get_lse()
         float lse = (rowmax != NEG_INF) ? rowmax + ptx_log2(rowsum) : NEG_INF;
         partial_lse[split_idx * total_heads + head_linear] = lse;
     }
@@ -371,7 +374,7 @@ __global__ void split_kv_reduce_v2(
 
     if (head_linear >= total_heads || tid >= HEAD_DIM) return;
 
-    // LSE values are in base-2 domain; use ptx_exp2 for merge (matches FlashInfer cascade.cuh)
+    // LSE values in log-base-2 domain; use ptx_exp2 for merge (matches FlashInfer cascade.cuh)
     float max_lse = NEG_INF;
     for (int s = 0; s < num_splits; s++) {
         float lse = partial_lse[s * total_heads + head_linear];
@@ -420,7 +423,7 @@ static void launch_decode(
     cudaStream_t stream
 ) {
     // Absorb k_scale into softmax scale, pre-multiply by log2(e)
-    // to match FlashInfer's log-base-2 domain (variants.cuh: sm_scale_log2)
+    // Matches FlashInfer: sm_scale_log2 = sm_scale * log2e (decode.cuh line 908)
     float scale = (1.0f / sqrtf((float)head_dim)) * k_scale * 1.44269504088896340736f;
 
     // Adaptive split count
